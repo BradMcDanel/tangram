@@ -1,5 +1,3 @@
-# video_tangram_detector_temporal_v3.py
-
 import cv2
 import numpy as np
 import json
@@ -8,45 +6,49 @@ import time
 import datetime
 
 # --- Global Detection Parameters ---
-MAX_RELAXATION_STEPS = 20
+MAX_RELAXATION_STEPS = 10
 RELAX_PERCENT_INCREMENT_CH0 = 0.001
 RELAX_PERCENT_INCREMENT_CH12 = 0.002
-AREA_RELAX_FACTOR_PER_STEP = 0.1
-MIN_CONTOUR_AREA_THRESHOLD = 5
-MIN_PIECES_FOR_ROI_DEFINITION = 2
-ROI_DIM_PERCENT_OF_IMAGE = 0.2
+AREA_RELAX_FACTOR_PER_STEP = 0.025
+MIN_PIECES_FOR_ROI_DEFINITION = 3
+ROI_DIM_PERCENT_OF_IMAGE = 0.45
 
 # --- Temporal Smoothing and Persistence Parameters ---
-CONFIRMATION_DURATION_SECONDS = 1.0
-DISAPPEARANCE_DURATION_SECONDS = 3.0
-QUESTIONABLE_DURATION_SECONDS = 3.0
-JITTER_CENTROID_THRESH = 25
-JITTER_AREA_THRESH_RATIO = 0.25
-CONFIRM_CENTROID_THRESH = 35
-CONFIRM_AREA_THRESH_RATIO = 0.35
+CONFIRM_STABLE_DURATION_S = 0.25
+CONFIRM_MIN_PERCENT_VISIBLE = 30.0
+POSITION_STABILITY_PX = 1
+AREA_STABILITY_RATIO = 0.01
+
 
 def get_poly_metrics(poly):
     if poly is None or len(poly) == 0: return None, 0
     M = cv2.moments(poly)
     area = M['m00']
     if area == 0:
-        x_coords, y_coords = poly[:, 0, 0], poly[:, 0, 1]
+        x_coords = poly[:, 0, 0]
+        y_coords = poly[:, 0, 1]
         if len(x_coords) == 0: return None, 0
-        cx, cy = np.mean(x_coords), np.mean(y_coords)
+        cx = np.mean(x_coords)
+        cy = np.mean(y_coords)
     else:
-        cx, cy = M['m10'] / area, M['m01'] / area
+        cx = M['m10'] / area
+        cy = M['m01'] / area
     return (int(cx), int(cy)), area
 
-def compare_polys(poly1, poly2, centroid_thresh, area_thresh_ratio):
-    if poly1 is None or poly2 is None or len(poly1) != len(poly2): return False
+def compare_polys_for_stability(poly1, poly2):
+    if poly1 is None or poly2 is None: return False
     c1, a1 = get_poly_metrics(poly1)
     c2, a2 = get_poly_metrics(poly2)
     if c1 is None or c2 is None: return False
+
     centroid_dist = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+
     if a1 == 0 and a2 == 0: area_diff_ok = True
-    elif a1 == 0 or a2 == 0 or max(a1, a2) == 0: area_diff_ok = False
-    else: area_diff_ok = (abs(a1 - a2) / max(a1, a2)) < area_thresh_ratio
-    return centroid_dist < centroid_thresh and area_diff_ok
+    elif a1 == 0 or a2 == 0: area_diff_ok = False
+    elif max(a1, a2) == 0 : area_diff_ok = True
+    else: area_diff_ok = (abs(a1 - a2) / max(a1, a2)) < AREA_STABILITY_RATIO
+
+    return centroid_dist < POSITION_STABILITY_PX and area_diff_ok
 
 def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows=True, frame_num_debug=0):
     img_h, img_w = frame.shape[:2]
@@ -64,7 +66,7 @@ def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows
         conv_img_masking = cv2.cvtColor(blur_frame, cv2.COLOR_BGR2LAB)
         ch0_max = 255
     else: return {}, frame.copy()
-    
+
     ch1_max, ch2_max = 255, 255
     morph_k = np.ones((3,3), np.uint8)
     output_display_img = (frame * 0.7).astype(np.uint8)
@@ -76,7 +78,7 @@ def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows
         up_thresh = np.array(p_attrs[f'{p_color_space}_upper'])
         tgt_verts = p_attrs['num_vertices']
         min_area, max_area = p_attrs.get('min_area', 0), p_attrs.get('max_area', float('inf'))
-        tgt_area_mid = (min_area + max_area) / 2.0
+        tgt_area_mid = (min_area + max_area) / 2.0 if max_area != float('inf') and (min_area + max_area) > 0 else min_area * 1.5 if min_area > 0 else 1.0
 
         color_mask = cv2.inRange(conv_img_masking, low_thresh, up_thresh)
         opened_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, morph_k, iterations=1)
@@ -90,13 +92,13 @@ def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows
         best_cnt, best_poly, min_area_diff = None, None, float('inf')
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if not (MIN_CONTOUR_AREA_THRESHOLD <= area <= max_area and area >= min_area): continue
+            if not (min_area <= area <= max_area): continue
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
-                for eps in np.arange(0.01, 0.08, 0.005):
+                for eps in np.arange(0.01, 1, 0.00125):
                     poly = cv2.approxPolyDP(cnt, eps * peri, True)
                     if len(poly) == tgt_verts:
-                        area_diff = abs(area - tgt_area_mid)
+                        area_diff = abs(area - tgt_area_mid) if tgt_area_mid > 0 else area
                         if area_diff < min_area_diff:
                             min_area_diff, best_cnt, best_poly = area_diff, cnt, poly
                         break
@@ -131,9 +133,9 @@ def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows
         orig_up_thresh = np.array(p_attrs[f'{p_color_space}_upper'])
         tgt_verts = p_attrs['num_vertices']
         min_area, max_area = p_attrs.get('min_area', 0), p_attrs.get('max_area', float('inf'))
-        tgt_area_mid = (min_area + max_area) / 2.0
+        tgt_area_mid = (min_area + max_area) / 2.0 if max_area != float('inf') and (min_area + max_area) > 0 else min_area * 1.5 if min_area > 0 else 1.0
         best_poly_overall, best_mask_overall, best_score, best_relax_step = None, None, float('inf'), float('inf')
-        
+
         for relax_step in range(MAX_RELAXATION_STEPS + 1):
             curr_low_thresh, curr_up_thresh = orig_low_thresh.copy(), orig_up_thresh.copy()
             if relax_step > 0:
@@ -150,7 +152,7 @@ def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows
             opened_mask_roi = cv2.morphologyEx(color_mask_roi, cv2.MORPH_OPEN, morph_k, iterations=1)
             proc_mask_roi = cv2.morphologyEx(opened_mask_roi, cv2.MORPH_CLOSE, morph_k, iterations=1)
 
-            if show_cv_windows and debug_pid_str == pid:
+            if show_cv_windows and debug_pid_str == pid and frame_debug_base.size > 0 :
                 debug_mask_disp_p3 = frame_debug_base.copy(); debug_mask_disp_p3[proc_mask_roi == 0] = 0
                 title = f"F{frame_num_debug} P3 P{pid} R{relax_step}" + (" (ROI)" if roi_defined else "")
                 cv2.imshow(title, debug_mask_disp_p3)
@@ -158,62 +160,75 @@ def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows
             contours_roi, _ = cv2.findContours(proc_mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt_roi in contours_roi:
                 area_roi = cv2.contourArea(cnt_roi)
-                if area_roi < MIN_CONTOUR_AREA_THRESHOLD: continue
                 min_area_mult = 1 - AREA_RELAX_FACTOR_PER_STEP * relax_step
                 max_area_mult = 1 + AREA_RELAX_FACTOR_PER_STEP * relax_step
                 relaxed_min_a = max(0.0, min_area * min_area_mult); relaxed_max_a = max_area * max_area_mult
                 if not (relaxed_min_a <= area_roi <= relaxed_max_a): continue
                 peri_roi = cv2.arcLength(cnt_roi, True)
                 if peri_roi > 0:
-                    for eps in np.arange(0.01, 0.08, 0.005):
+                    for eps in np.arange(0.01, 1.0, 0.000625):
                         poly_roi = cv2.approxPolyDP(cnt_roi, eps * peri_roi, True)
                         if len(poly_roi) == tgt_verts:
-                            area_diff_curr = abs(area_roi - tgt_area_mid)
+                            area_diff_curr = abs(area_roi - tgt_area_mid) if tgt_area_mid > 0 else area_roi
                             if relax_step < best_relax_step or (relax_step == best_relax_step and area_diff_curr < best_score):
                                 best_score, best_relax_step = area_diff_curr, relax_step
                                 best_poly_overall = poly_roi + np.array([off_x, off_y])
-                                full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                                temp_mask_roi_cnt = np.zeros_like(proc_mask_roi)
-                                cv2.drawContours(temp_mask_roi_cnt, [cnt_roi], -1, 255, thickness=cv2.FILLED)
-                                temp_mask_roi_ref = cv2.bitwise_and(temp_mask_roi_cnt, proc_mask_roi)
-                                h_roi_m, w_roi_m = temp_mask_roi_ref.shape
-                                if off_y + h_roi_m <= img_h and off_x + w_roi_m <= img_w:
-                                    full_mask[off_y:off_y+h_roi_m, off_x:off_x+w_roi_m] = temp_mask_roi_ref
-                                best_mask_overall = full_mask
                             break
         if best_poly_overall is not None:
-            raw_detected_piece_data[pid] = {'poly': best_poly_overall, 'mask': best_mask_overall, 'relax_step': best_relax_step}
+            raw_detected_piece_data[pid] = {'poly': best_poly_overall}
             if show_cv_windows and debug_pid_str == pid and best_mask_overall is not None:
                  output_display_img[best_mask_overall > 0] = frame[best_mask_overall > 0]
     return raw_detected_piece_data, output_display_img
 
+def get_default_piece_state():
+    return {
+        'status': 'UNSEEN',
+        'candidate_poly': None,
+        'candidate_recent_detections': [],
+        'locked_poly': None,
+        'frames_unseen_at_locked_pos': 0
+    }
+
 def main():
-    parser = argparse.ArgumentParser(description="Tangram detection with temporal smoothing and questionable state.")
+    parser = argparse.ArgumentParser(description="Tangram detection with revised temporal persistence.")
     parser.add_argument("--video", required=True, help="Input video file.")
     parser.add_argument("--config", required=True, help="JSON config file.")
     parser.add_argument("--output_json", required=True, help="Output JSON file.")
     parser.add_argument("--debug_piece_id", type=str, default=None, help="ID for debug masks.")
     parser.add_argument("--no_display", action="store_true", help="Disable OpenCV display.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose console logs.")
+    parser.add_argument("--realtime", action="store_true", help="Playback video in real-time (if display is enabled).")
     args = parser.parse_args()
 
     start_processing_time = time.time()
     with open(args.config, 'r') as f: config_data_content = json.load(f)
-    
+
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened(): print(f"Error: Cannot open video {args.video}"); return
 
     fps = cap.get(cv2.CAP_PROP_FPS); fps = fps if fps > 0 else 30.0
-    confirmation_frames = int(CONFIRMATION_DURATION_SECONDS * fps)
-    disappearance_frames = int(DISAPPEARANCE_DURATION_SECONDS * fps)
-    questionable_frames_max = int(QUESTIONABLE_DURATION_SECONDS * fps)
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    confirmation_window_frames = int(CONFIRM_STABLE_DURATION_S * fps)
+
+    confirmation_min_positive_detections = 0
+    if confirmation_window_frames > 0 :
+        confirmation_min_positive_detections = int(confirmation_window_frames * (CONFIRM_MIN_PERCENT_VISIBLE / 100.0))
+        if confirmation_min_positive_detections == 0 and CONFIRM_MIN_PERCENT_VISIBLE > 0:
+             confirmation_min_positive_detections = 1
+    elif CONFIRM_STABLE_DURATION_S > 0 and CONFIRM_MIN_PERCENT_VISIBLE > 0 :
+        confirmation_min_positive_detections = 1
+
 
     frames_data_for_json = []
-    piece_states = {} 
+    piece_states = {pid: get_default_piece_state() for pid in config_data_content}
     frame_idx = 0
     total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     while cap.isOpened():
+        loop_start_time = time.time()
         ret, frame = cap.read()
         if not ret: break
         current_frame_timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
@@ -226,76 +241,127 @@ def main():
         raw_detections, output_display_img_base = process_single_frame(
             frame.copy(), config_data_content, args.debug_piece_id, not args.no_display, frame_idx
         )
-        
+
         current_frame_output_pieces_list = []
-        
+
         for piece_id, piece_cfg in config_data_content.items():
-            state = piece_states.get(piece_id, {
-                "confirmed_poly": None, "tentative_poly": None, "is_currently_confirmed": False,
-                "tentative_frames": 0, "frames_since_last_seen": 0,
-                "is_questionable": False, "questionable_frames_count": 0, "last_good_raw_poly_before_questionable": None
-            })
+            state = piece_states[piece_id]
             raw_poly_data = raw_detections.get(piece_id)
             raw_poly = raw_poly_data['poly'] if raw_poly_data else None
             output_poly_for_this_piece = None
 
-            if raw_poly is not None: # Piece IS detected in the current raw frame
-                state["frames_since_last_seen"] = 0
-                if state["is_currently_confirmed"]:
-                    if state["is_questionable"]: # Was questionable, now we see it again
-                        if compare_polys(raw_poly, state["last_good_raw_poly_before_questionable"], JITTER_CENTROID_THRESH, JITTER_AREA_THRESH_RATIO):
-                            # It returned to its pre-questionable state (or close enough)
-                            state["is_questionable"] = False; state["questionable_frames_count"] = 0
-                            state["confirmed_poly"] = state["last_good_raw_poly_before_questionable"] # Re-affirm
-                            state["tentative_poly"] = raw_poly # Current raw is now tentative for next frame
-                            output_poly_for_this_piece = state["confirmed_poly"]
-                        elif compare_polys(raw_poly, state["tentative_poly"], CONFIRM_CENTROID_THRESH, CONFIRM_AREA_THRESH_RATIO):
-                            # It's different from pre-questionable, but consistent with the new direction
-                            state["is_questionable"] = False; state["questionable_frames_count"] = 0
-                            state["is_currently_confirmed"] = False # Lost confirmation due to sustained change
-                            state["tentative_poly"] = raw_poly; state["tentative_frames"] = 1 # Start re-confirming new spot
-                        else: # Still questionable, and current raw is different again
-                            state["questionable_frames_count"] += 1
-                            state["tentative_poly"] = raw_poly # Track this new raw poly
-                            if state["questionable_frames_count"] >= questionable_frames_max:
-                                state["is_questionable"] = False; state["is_currently_confirmed"] = False
-                                state["tentative_frames"] = 1 # Start re-confirming from this new spot
-                            else: output_poly_for_this_piece = state["confirmed_poly"] # Keep showing old confirmed during questionable
-                    elif compare_polys(raw_poly, state["confirmed_poly"], JITTER_CENTROID_THRESH, JITTER_AREA_THRESH_RATIO):
-                        # Standard confirmed, and it's just jitter
-                        output_poly_for_this_piece = state["confirmed_poly"]
-                        state["tentative_poly"] = raw_poly # Update tentative to current raw for future checks
-                        state["tentative_frames"] = confirmation_frames # Reset confirmation strength
-                        state["is_questionable"] = False; state["questionable_frames_count"] = 0
-                    else: # Confirmed, but raw_poly is too different (not jitter) -> becomes questionable
-                        state["is_questionable"] = True; state["questionable_frames_count"] = 1
-                        state["last_good_raw_poly_before_questionable"] = state["confirmed_poly"] # Store what it looked like
-                        state["tentative_poly"] = raw_poly # This new raw_poly is the first tentative in the questionable sequence
-                        output_poly_for_this_piece = state["confirmed_poly"] # Still show old confirmed for now
-                else: # Piece is NOT currently confirmed (might be tentative or new)
-                    state["is_questionable"] = False; state["questionable_frames_count"] = 0 # Cannot be questionable if not confirmed
-                    if state["tentative_poly"] is not None and \
-                       compare_polys(raw_poly, state["tentative_poly"], CONFIRM_CENTROID_THRESH, CONFIRM_AREA_THRESH_RATIO):
-                        state["tentative_frames"] += 1; state["tentative_poly"] = raw_poly
-                    else: state["tentative_poly"] = raw_poly; state["tentative_frames"] = 1
-                    
-                    if state["tentative_frames"] >= confirmation_frames:
-                        state["is_currently_confirmed"] = True; state["confirmed_poly"] = state["tentative_poly"]
-                        output_poly_for_this_piece = state["confirmed_poly"]
-            else: # Piece is NOT detected in the current raw frame
-                state["frames_since_last_seen"] += 1
-                state["tentative_frames"] = 0; state["tentative_poly"] = None # Reset tentative
-                if state["is_questionable"]:
-                    state["questionable_frames_count"] += 1
-                    if state["questionable_frames_count"] >= questionable_frames_max:
-                        state["is_questionable"] = False; state["is_currently_confirmed"] = False; state["confirmed_poly"] = None
-                    else: output_poly_for_this_piece = state["confirmed_poly"] # Keep showing old during questionable
-                elif state["is_currently_confirmed"]:
-                    if state["frames_since_last_seen"] < disappearance_frames:
-                        output_poly_for_this_piece = state["confirmed_poly"]
-                    else: state["is_currently_confirmed"] = False; state["confirmed_poly"] = None
-                else: # Not confirmed, not questionable, and not seen -> definitely not there
-                    state["is_questionable"] = False; state["questionable_frames_count"] = 0
+            if state['status'] == 'UNSEEN':
+                if raw_poly is not None:
+                    state['status'] = 'CONFIRMING'
+                    state['candidate_poly'] = raw_poly
+                    state['candidate_recent_detections'] = [True]
+                    if confirmation_window_frames == 0 and 1 >= confirmation_min_positive_detections:
+                        state['status'] = 'LOCKED'
+                        state['locked_poly'] = state['candidate_poly']
+                        state['frames_unseen_at_locked_pos'] = 0
+                        state['candidate_poly'] = None
+                        state['candidate_recent_detections'] = []
+
+            if state['status'] == 'CONFIRMING':
+                if raw_poly is not None:
+                    if state['candidate_poly'] is None:
+                        state['candidate_poly'] = raw_poly
+                        state['candidate_recent_detections'] = [True]
+                    elif compare_polys_for_stability(raw_poly, state['candidate_poly']):
+                        state['candidate_recent_detections'].append(True)
+                    else:
+                        state['candidate_poly'] = raw_poly
+                        state['candidate_recent_detections'] = [True]
+                else:
+                    if state['candidate_poly'] is not None:
+                        state['candidate_recent_detections'].append(False)
+
+                while len(state['candidate_recent_detections']) > confirmation_window_frames and confirmation_window_frames > 0:
+                    state['candidate_recent_detections'].pop(0)
+
+                if confirmation_window_frames == 0 and state['candidate_poly'] is not None:
+                    if 1 >= confirmation_min_positive_detections:
+                        state['status'] = 'LOCKED'
+                        state['locked_poly'] = state['candidate_poly']
+                        state['frames_unseen_at_locked_pos'] = 0
+                        state['candidate_poly'] = None
+                        state['candidate_recent_detections'] = []
+                    else:
+                        state.update(get_default_piece_state())
+                        state['status'] = 'UNSEEN'
+                elif len(state['candidate_recent_detections']) == confirmation_window_frames and \
+                     state['candidate_poly'] is not None and confirmation_window_frames > 0:
+                    positive_detections_count = sum(state['candidate_recent_detections'])
+                    if positive_detections_count >= confirmation_min_positive_detections:
+                        state['status'] = 'LOCKED'
+                        state['locked_poly'] = state['candidate_poly']
+                        state['frames_unseen_at_locked_pos'] = 0
+                        state['candidate_poly'] = None
+                        state['candidate_recent_detections'] = []
+                    else:
+                        if state['locked_poly'] is not None:
+                            state['status'] = 'LOCKED'
+                            state['candidate_poly'] = None
+                            state['candidate_recent_detections'] = []
+                        else:
+                            state.update(get_default_piece_state())
+                            state['status'] = 'UNSEEN'
+
+            if state['status'] == 'LOCKED':
+                output_poly_for_this_piece = state['locked_poly']
+                seen_at_locked_pos_this_frame = False
+
+                if raw_poly is not None:
+                    if compare_polys_for_stability(raw_poly, state['locked_poly']):
+                        seen_at_locked_pos_this_frame = True
+                        state['frames_unseen_at_locked_pos'] = 0
+                        state['candidate_poly'] = None
+                        state['candidate_recent_detections'] = []
+                    else:
+                        if state['candidate_poly'] is None or \
+                           not compare_polys_for_stability(raw_poly, state['candidate_poly']):
+                            state['candidate_poly'] = raw_poly
+                            state['candidate_recent_detections'] = [True]
+                        else:
+                            state['candidate_recent_detections'].append(True)
+                        
+                        while len(state['candidate_recent_detections']) > confirmation_window_frames and confirmation_window_frames > 0:
+                            state['candidate_recent_detections'].pop(0)
+
+                        reloc_candidate_confirmed = False
+                        if confirmation_window_frames == 0 and state['candidate_poly'] is not None:
+                            if 1 >= confirmation_min_positive_detections:
+                                reloc_candidate_confirmed = True
+                        elif len(state['candidate_recent_detections']) == confirmation_window_frames and \
+                             state['candidate_poly'] is not None and confirmation_window_frames > 0:
+                            if sum(state['candidate_recent_detections']) >= confirmation_min_positive_detections:
+                                reloc_candidate_confirmed = True
+                        
+                        if reloc_candidate_confirmed:
+                            state['locked_poly'] = state['candidate_poly']
+                            output_poly_for_this_piece = state['locked_poly']
+                            state['frames_unseen_at_locked_pos'] = 0
+                            state['candidate_poly'] = None
+                            state['candidate_recent_detections'] = []
+                            seen_at_locked_pos_this_frame = True
+
+                else:
+                    if state['candidate_poly'] is not None:
+                        state['candidate_recent_detections'].append(False)
+                        while len(state['candidate_recent_detections']) > confirmation_window_frames and confirmation_window_frames > 0:
+                            state['candidate_recent_detections'].pop(0)
+                        
+                        if len(state['candidate_recent_detections']) == confirmation_window_frames and confirmation_window_frames > 0:
+                            if sum(state['candidate_recent_detections']) < confirmation_min_positive_detections:
+                                state['candidate_poly'] = None
+                                state['candidate_recent_detections'] = []
+                        elif confirmation_window_frames == 0 and 1 < confirmation_min_positive_detections:
+                                state['candidate_poly'] = None 
+                                state['candidate_recent_detections'] = []
+
+
+                if not seen_at_locked_pos_this_frame:
+                    state['frames_unseen_at_locked_pos'] += 1
             
             piece_states[piece_id] = state
             if output_poly_for_this_piece is not None:
@@ -303,13 +369,12 @@ def main():
                     "piece_id": piece_id,
                     "color_name": piece_cfg.get("color_name", "N/A"),
                     "class_name": piece_cfg.get("class_name", "N/A"),
-                    "timestamp_ms": current_frame_timestamp_ms,
                     "vertices": output_poly_for_this_piece.reshape(-1, 2).tolist()
                 })
                 cv2.drawContours(output_display_img_base, [output_poly_for_this_piece], -1, (0, 255, 0), 2)
                 for v_x, v_y in output_poly_for_this_piece.reshape(-1, 2):
                     cv2.circle(output_display_img_base, (int(v_x), int(v_y)), 3, (0, 0, 255), -1)
-        
+
         frames_data_for_json.append({
             "frame_index": frame_idx,
             "frame_timestamp_ms": current_frame_timestamp_ms,
@@ -317,12 +382,23 @@ def main():
         })
 
         if not args.no_display:
-            cv2.imshow("Tangram Detection (Temporal V3)", output_display_img_base)
-            key = cv2.waitKey(1) & 0xFF
+            display_wait_ms = 1
+            if args.realtime:
+                loop_end_time = time.time()
+                processing_time_sec = loop_end_time - loop_start_time
+                target_frame_interval_sec = 1.0 / fps if fps > 0 else 0.033
+                wait_time_sec = target_frame_interval_sec - processing_time_sec
+                if wait_time_sec > 0:
+                    display_wait_ms = int(wait_time_sec * 1000)
+                display_wait_ms = max(1, display_wait_ms)
+
+            cv2.imshow("Tangram Detection", output_display_img_base)
+            key = cv2.waitKey(display_wait_ms) & 0xFF
             if key == ord('q'): break
             if key == ord('p') and args.debug_piece_id:
-                if args.verbose: print(f"Paused on frame {frame_idx}. Press key to resume.")
+                if args.verbose: print(f"Paused on frame {frame_idx}. Press any key to resume.")
                 cv2.waitKey(0)
+
         frame_idx += 1
 
     cap.release()
@@ -331,25 +407,23 @@ def main():
 
     output_json_content = {
         "metadata": {
-            "processing_start_utc": datetime.datetime.utcfromtimestamp(start_processing_time).isoformat() + "Z",
+            "processing_start_utc": datetime.datetime.fromtimestamp(start_processing_time, datetime.timezone.utc).isoformat(),
             "processing_duration_seconds": round(end_processing_time - start_processing_time, 3),
             "video_file": args.video,
             "config_file": args.config,
             "output_file": args.output_json,
             "total_frames_processed": frame_idx,
             "video_fps": round(fps,2),
+            "image_width": frame_width,
+            "image_height": frame_height,
             "command_line_args": vars(args),
             "temporal_params": {
-                "CONFIRMATION_DURATION_SECONDS": CONFIRMATION_DURATION_SECONDS,
-                "DISAPPEARANCE_DURATION_SECONDS": DISAPPEARANCE_DURATION_SECONDS,
-                "QUESTIONABLE_DURATION_SECONDS": QUESTIONABLE_DURATION_SECONDS,
-                "JITTER_CENTROID_THRESH": JITTER_CENTROID_THRESH,
-                "JITTER_AREA_THRESH_RATIO": JITTER_AREA_THRESH_RATIO,
-                "CONFIRM_CENTROID_THRESH": CONFIRM_CENTROID_THRESH,
-                "CONFIRM_AREA_THRESH_RATIO": CONFIRM_AREA_THRESH_RATIO,
-                "confirmation_frames_calculated": confirmation_frames,
-                "disappearance_frames_calculated": disappearance_frames,
-                "questionable_frames_max_calculated": questionable_frames_max
+                "CONFIRM_STABLE_DURATION_S": CONFIRM_STABLE_DURATION_S,
+                "CONFIRM_MIN_PERCENT_VISIBLE": CONFIRM_MIN_PERCENT_VISIBLE,
+                "POSITION_STABILITY_PX": POSITION_STABILITY_PX,
+                "AREA_STABILITY_RATIO": AREA_STABILITY_RATIO,
+                "confirmation_window_frames_calc": confirmation_window_frames,
+                "confirmation_min_positive_detections_calc": confirmation_min_positive_detections
             }
         },
         "config_data_used": config_data_content,
