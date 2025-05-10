@@ -5,323 +5,417 @@ import argparse
 import time
 import datetime
 
-# --- Global Detection Parameters ---
-MAX_RELAXATION_STEPS = 10
-RELAX_PERCENT_INCREMENT_CH0 = 0.001
-RELAX_PERCENT_INCREMENT_CH12 = 0.002
-AREA_RELAX_FACTOR_PER_STEP = 0.025
-MIN_PIECES_FOR_ROI_DEFINITION = 3
-ROI_DIM_PERCENT_OF_IMAGE = 0.45
+# --- Configuration Constants ---
+
+# --- Table Detection & Warping Parameters ---
+TABLE_LOWER_HSV = np.array([100, 0, 115])
+TABLE_UPPER_HSV = np.array([179, 35, 190])
+TABLE_MORPH_KERNEL_SIZE = (5, 5)
+TABLE_MORPH_OPEN_ITERATIONS = 1
+TABLE_MORPH_CLOSE_ITERATIONS = 2
+TABLE_APPROX_POLY_EPSILON_FACTOR = 0.03
+TABLE_REGION_UPPER_PERCENTAGE = 0.45
+TABLE_CORNER_EXTRUSION_PIXELS = 5
+TABLE_OUTLINE_COLOR_BGR = (255, 192, 0) # Light Blue
+TABLE_OUTLINE_THICKNESS = 1
+
+# --- Tangram Piece Detection Parameters ---
+PIECE_BLUR_KERNEL_SIZE = (5, 5)
+PIECE_MORPH_KERNEL_SIZE = (3, 3)
+PIECE_MORPH_OPEN_ITERATIONS = 1
+PIECE_MORPH_CLOSE_ITERATIONS = 1
+PIECE_CORNER_EXTRUSION_PIXELS = 3
+PIECE_EPSILON_SEARCH_START = 0.01
+PIECE_EPSILON_SEARCH_END = 0.1
+PIECE_EPSILON_SEARCH_STEP = 0.001
+
+# --- Shape Regularity Parameters ---
+MIN_ALLOWED_ANGLE_DEG = 30.0
+MAX_ALLOWED_ANGLE_DEG = 130.0
+SQUARE_TARGET_ANGLE_DEG = 90.0
+SQUARE_ANGLE_TOLERANCE_DEG = 15.0
+PARALLELOGRAM_OPPOSITE_ANGLE_DIFF_TOLERANCE_DEG = 30.0
+PARALLELOGRAM_ADJACENT_ANGLE_SUM_TARGET_DEG = 180.0
+PARALLELOGRAM_ADJACENT_ANGLE_SUM_TOLERANCE_DEG = 30.0
+
+# --- Relaxation Parameters for Piece Detection ---
+MAX_RELAXATION_STEPS = 5
+RELAX_PERCENT_INCREMENT_CH0 = 0.001 # For Hue
+RELAX_PERCENT_INCREMENT_CH12 = 0.002 # For Saturation & Value
+AREA_RELAX_FACTOR_PER_STEP = 0.01
+
+# --- Scoring Parameters for Piece Detection (NEW) ---
+WEIGHT_COLOR_CLOSENESS = 0.6
+WEIGHT_AREA_CLOSENESS = 0.4
 
 # --- Temporal Smoothing and Persistence Parameters ---
-CONFIRM_STABLE_DURATION_S = 0.25
+CONFIRM_STABLE_DURATION_S = 0.5
 CONFIRM_MIN_PERCENT_VISIBLE = 30.0
-POSITION_STABILITY_PX = 1
-AREA_STABILITY_RATIO = 0.01
+POSITION_STABILITY_PX = 3
+AREA_STABILITY_RATIO = 0.15
 
+# --- Drawing Parameters ---
+PIECE_LOCKED_COLOR_BGR = (0, 255, 0) # Green
+PIECE_LOCKED_THICKNESS = 1
+PIECE_VERTEX_COLOR_BGR = (0, 0, 255) # Red
+PIECE_VERTEX_RADIUS = 1
+
+
+# --- Helper Functions ---
+def normalize_vector(v):
+    norm = np.linalg.norm(v)
+    if norm == 0: return v
+    return v / norm
+
+def order_points_for_quad(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = pts[:, 1] - pts[:, 0] # y - x
+    temp_pts_with_diff = []
+    for i in range(len(pts)):
+        if not np.array_equal(pts[i], rect[0]) and not np.array_equal(pts[i], rect[2]):
+            temp_pts_with_diff.append((pts[i], diff[i]))
+    if len(temp_pts_with_diff) == 2:
+        temp_pts_with_diff.sort(key=lambda x: x[1]) # Sort by y-x; smallest is TR, largest is BL
+        rect[1] = temp_pts_with_diff[0][0] # Top-right
+        rect[3] = temp_pts_with_diff[1][0] # Bottom-left
+    else:
+        print(f"WARNING: order_points_for_quad found {len(temp_pts_with_diff)} remaining points, expected 2. Input pts: {pts.tolist()}")
+        return None
+    return rect
+
+def extrude_polygon_corners(polygon, extrusion_pixels):
+    if polygon is None or extrusion_pixels == 0: return polygon
+    if polygon.ndim == 3 and polygon.shape[1] == 1: poly_2d = polygon.reshape(-1, 2).astype(np.float32)
+    elif polygon.ndim == 2: poly_2d = polygon.astype(np.float32)
+    else: return polygon
+    num_corners = len(poly_2d)
+    if num_corners < 3: return polygon
+    extruded_corners_list = []
+    for i in range(num_corners):
+        P = poly_2d[i]; prev_P = poly_2d[(i - 1 + num_corners) % num_corners]; next_P = poly_2d[(i + 1) % num_corners]
+        vec1 = P - prev_P; vec2 = P - next_P
+        norm_vec1 = normalize_vector(vec1); norm_vec2 = normalize_vector(vec2)
+        direction_outward = normalize_vector(norm_vec1 + norm_vec2)
+        extruded_P = P + extrusion_pixels * direction_outward if not np.all(direction_outward == 0) else P
+        extruded_corners_list.append(extruded_P)
+    if polygon.ndim == 3 and polygon.shape[1] == 1: return np.array(extruded_corners_list, dtype=np.float32).reshape(-1,1,2)
+    return np.array(extruded_corners_list, dtype=np.float32)
+
+def calculate_internal_angles(polygon):
+    if polygon.ndim == 3 and polygon.shape[1] == 1: pts = polygon.reshape(-1, 2)
+    elif polygon.ndim == 2: pts = polygon
+    else: return []
+    num_vertices = len(pts)
+    if num_vertices < 3: return []
+    angles = []
+    for i in range(num_vertices):
+        p_prev = pts[(i - 1 + num_vertices) % num_vertices]; p_curr = pts[i]; p_next = pts[(i + 1) % num_vertices]
+        v1 = p_prev - p_curr; v2 = p_next - p_curr
+        dot_product = np.dot(v1, v2); mag_v1 = np.linalg.norm(v1); mag_v2 = np.linalg.norm(v2)
+        if mag_v1 * mag_v2 == 0: angles.append(0); continue
+        cos_angle = np.clip(dot_product / (mag_v1 * mag_v2), -1.0, 1.0)
+        angles.append(np.degrees(np.arccos(cos_angle)))
+    return angles
+
+def is_shape_regular(polygon, shape_class_name, num_vertices_expected):
+    if polygon is None or len(polygon) != num_vertices_expected: return False
+    angles = calculate_internal_angles(polygon)
+    if not angles or len(angles) != num_vertices_expected: return False
+    for angle in angles:
+        if not (MIN_ALLOWED_ANGLE_DEG <= angle <= MAX_ALLOWED_ANGLE_DEG): return False
+    if shape_class_name == "Triangle": return True
+    elif shape_class_name == "Square":
+        for angle in angles:
+            if not (SQUARE_TARGET_ANGLE_DEG - SQUARE_ANGLE_TOLERANCE_DEG <= angle <= \
+                    SQUARE_TARGET_ANGLE_DEG + SQUARE_ANGLE_TOLERANCE_DEG): return False
+        return True
+    elif shape_class_name == "Parallelogram":
+        if abs(angles[0] - angles[2]) > PARALLELOGRAM_OPPOSITE_ANGLE_DIFF_TOLERANCE_DEG: return False
+        if abs(angles[1] - angles[3]) > PARALLELOGRAM_OPPOSITE_ANGLE_DIFF_TOLERANCE_DEG: return False
+        for i in range(4):
+            if abs((angles[i] + angles[(i+1)%4]) - PARALLELOGRAM_ADJACENT_ANGLE_SUM_TARGET_DEG) > PARALLELOGRAM_ADJACENT_ANGLE_SUM_TOLERANCE_DEG: return False
+        return True
+    return True
+
+def initialize_table_warp_parameters(first_frame):
+    hsv = cv2.cvtColor(first_frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, TABLE_LOWER_HSV, TABLE_UPPER_HSV)
+    kernel = np.ones(TABLE_MORPH_KERNEL_SIZE, np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=TABLE_MORPH_OPEN_ITERATIONS)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=TABLE_MORPH_CLOSE_ITERATIONS)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: print("ERROR: No table contours found."); return None, None, 0, 0, None
+    table_contour = max(contours, key=cv2.contourArea)
+    hull = cv2.convexHull(table_contour)
+    perimeter_hull = cv2.arcLength(hull, True)
+    epsilon = TABLE_APPROX_POLY_EPSILON_FACTOR * perimeter_hull
+    approx_poly_table = cv2.approxPolyDP(hull, epsilon, True)
+    if len(approx_poly_table) != 4: print(f"ERROR: Table approx to {len(approx_poly_table)} points."); return None, None, 0, 0, None
+    table_corners = approx_poly_table.reshape(4, 2).astype(np.float32)
+    ordered_table_corners = order_points_for_quad(table_corners)
+    if ordered_table_corners is None: print("ERROR: Could not order table corners."); return None, None, 0, 0, None
+    ordered_table_corners = extrude_polygon_corners(ordered_table_corners, TABLE_CORNER_EXTRUSION_PIXELS)
+    (tl_table, tr_table, br_table, bl_table) = ordered_table_corners
+    p_left_new_y = tl_table[1] + TABLE_REGION_UPPER_PERCENTAGE * (bl_table[1] - tl_table[1]); p_left_new_x = tl_table[0] + TABLE_REGION_UPPER_PERCENTAGE * (bl_table[0] - tl_table[0])
+    bl_region = np.array([p_left_new_x, p_left_new_y], dtype=np.float32)
+    p_right_new_y = tr_table[1] + TABLE_REGION_UPPER_PERCENTAGE * (br_table[1] - tr_table[1]); p_right_new_x = tr_table[0] + TABLE_REGION_UPPER_PERCENTAGE * (br_table[0] - tr_table[0])
+    br_region = np.array([p_right_new_x, p_right_new_y], dtype=np.float32)
+    upper_region_corners_orig_float = np.array([tl_table.astype(np.float32), tr_table.astype(np.float32), br_region, bl_region], dtype=np.float32)
+    upper_region_corners_orig_int = upper_region_corners_orig_float.astype(np.int32)
+    width_top = np.linalg.norm(tr_table - tl_table); width_bottom = np.linalg.norm(br_region - bl_region)
+    warp_width = int(max(width_top, width_bottom))
+    height_left = np.linalg.norm(bl_region - tl_table); height_right = np.linalg.norm(br_region - tr_table)
+    warp_height = int(max(height_left, height_right))
+    if warp_width <= 0 or warp_height <= 0: print(f"ERROR: Invalid warp dimensions ({warp_width}x{warp_height})."); return None, None, 0, 0, None
+    dst_pts_warp = np.array([[0, 0], [warp_width - 1, 0], [warp_width - 1, warp_height - 1], [0, warp_height - 1]], dtype="float32")
+    perspective_M = cv2.getPerspectiveTransform(upper_region_corners_orig_float, dst_pts_warp)
+    ret_invert, inverse_perspective_M = cv2.invert(perspective_M)
+    if not ret_invert: print("ERROR: Could not invert perspective matrix."); return None, None, 0, 0, None
+    return perspective_M, inverse_perspective_M, warp_width, warp_height, upper_region_corners_orig_int
 
 def get_poly_metrics(poly):
     if poly is None or len(poly) == 0: return None, 0
-    M = cv2.moments(poly)
+    if poly.ndim == 2: poly_for_moments = poly.reshape(-1,1,2).astype(np.int32)
+    else: poly_for_moments = poly.astype(np.int32)
+    M = cv2.moments(poly_for_moments)
     area = M['m00']
+    current_poly_pts = poly.reshape(-1,2)
     if area == 0:
-        x_coords = poly[:, 0, 0]
-        y_coords = poly[:, 0, 1]
-        if len(x_coords) == 0: return None, 0
-        cx = np.mean(x_coords)
-        cy = np.mean(y_coords)
+        if len(current_poly_pts) == 0: return None, 0
+        cx = np.mean(current_poly_pts[:,0]); cy = np.mean(current_poly_pts[:,1])
     else:
-        cx = M['m10'] / area
-        cy = M['m01'] / area
+        cx = M['m10'] / area; cy = M['m01'] / area
     return (int(cx), int(cy)), area
 
 def compare_polys_for_stability(poly1, poly2):
     if poly1 is None or poly2 is None: return False
-    c1, a1 = get_poly_metrics(poly1)
-    c2, a2 = get_poly_metrics(poly2)
+    c1, a1 = get_poly_metrics(poly1); c2, a2 = get_poly_metrics(poly2)
     if c1 is None or c2 is None: return False
-
     centroid_dist = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
-
     if a1 == 0 and a2 == 0: area_diff_ok = True
-    elif a1 == 0 or a2 == 0: area_diff_ok = False
-    elif max(a1, a2) == 0 : area_diff_ok = True
+    elif a1 == 0 or a2 == 0 or max(a1,a2) == 0: area_diff_ok = False
     else: area_diff_ok = (abs(a1 - a2) / max(a1, a2)) < AREA_STABILITY_RATIO
-
     return centroid_dist < POSITION_STABILITY_PX and area_diff_ok
 
-def process_single_frame(frame, config_data, debug_pid_str=None, show_cv_windows=True, frame_num_debug=0):
-    img_h, img_w = frame.shape[:2]
-    if not config_data: return {}, frame.copy()
-    first_pid = next(iter(config_data), None)
-    if not first_pid: return {}, frame.copy()
+def get_hue_distance(h1, h2, max_hue_val=179):
+    """Calculates the shortest distance between two hue values on a circle (0-max_hue_val)."""
+    diff = abs(h1 - h2)
+    return min(diff, (max_hue_val + 1) - diff)
 
-    g_color_space = config_data[first_pid]['color_space']
-    blur_frame = cv2.GaussianBlur(frame, (5, 5), 0)
+def process_tangrams_in_warped_frame(warped_frame, config_data, debug_pid_str=None, show_cv_windows=True, frame_num_debug=0):
+    if warped_frame is None or warped_frame.size == 0: print("ERROR: Received empty warped_frame."); return {}
 
-    if g_color_space == 'hsv':
-        conv_img_masking = cv2.cvtColor(blur_frame, cv2.COLOR_BGR2HSV)
-        ch0_max = 179
-    elif g_color_space == 'lab':
-        conv_img_masking = cv2.cvtColor(blur_frame, cv2.COLOR_BGR2LAB)
-        ch0_max = 255
-    else: return {}, frame.copy()
+    blur_warped_frame = cv2.GaussianBlur(warped_frame, PIECE_BLUR_KERNEL_SIZE, 0)
+    # Assuming HSV color space for all pieces as per simplification
+    conv_img_masking = cv2.cvtColor(blur_warped_frame, cv2.COLOR_BGR2HSV)
+    ch0_max, ch1_max, ch2_max = 179, 255, 255 # Max values for H, S, V
 
-    ch1_max, ch2_max = 255, 255
-    morph_k = np.ones((3,3), np.uint8)
-    output_display_img = (frame * 0.7).astype(np.uint8)
-
-    initial_detections = {}
-    for pid, p_attrs in config_data.items():
-        p_color_space = p_attrs['color_space']
-        low_thresh = np.array(p_attrs[f'{p_color_space}_lower'])
-        up_thresh = np.array(p_attrs[f'{p_color_space}_upper'])
-        tgt_verts = p_attrs['num_vertices']
-        min_area, max_area = p_attrs.get('min_area', 0), p_attrs.get('max_area', float('inf'))
-        tgt_area_mid = (min_area + max_area) / 2.0 if max_area != float('inf') and (min_area + max_area) > 0 else min_area * 1.5 if min_area > 0 else 1.0
-
-        color_mask = cv2.inRange(conv_img_masking, low_thresh, up_thresh)
-        opened_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, morph_k, iterations=1)
-        proc_mask = cv2.morphologyEx(opened_mask, cv2.MORPH_CLOSE, morph_k, iterations=1)
-
-        if show_cv_windows and debug_pid_str == pid:
-            debug_mask_disp = frame.copy(); debug_mask_disp[proc_mask == 0] = 0
-            cv2.imshow(f"F{frame_num_debug} P1 Raw P{pid}", debug_mask_disp)
-
-        contours, _ = cv2.findContours(proc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best_cnt, best_poly, min_area_diff = None, None, float('inf')
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if not (min_area <= area <= max_area): continue
-            peri = cv2.arcLength(cnt, True)
-            if peri > 0:
-                for eps in np.arange(0.01, 1, 0.00125):
-                    poly = cv2.approxPolyDP(cnt, eps * peri, True)
-                    if len(poly) == tgt_verts:
-                        area_diff = abs(area - tgt_area_mid) if tgt_area_mid > 0 else area
-                        if area_diff < min_area_diff:
-                            min_area_diff, best_cnt, best_poly = area_diff, cnt, poly
-                        break
-        if best_cnt is not None: initial_detections[pid] = {'contour': best_cnt, 'poly': best_poly}
-
-    roi_x, roi_y, roi_w, roi_h = 0, 0, img_w, img_h
-    roi_defined = False
-    if len(initial_detections) >= MIN_PIECES_FOR_ROI_DEFINITION:
-        centroids_x, centroids_y = [], []
-        for data in initial_detections.values():
-            M = cv2.moments(data['contour'])
-            if M["m00"] != 0:
-                centroids_x.append(int(M["m10"] / M["m00"])); centroids_y.append(int(M["m01"] / M["m00"]))
-        if centroids_x and centroids_y:
-            med_cx, med_cy = int(np.median(centroids_x)), int(np.median(centroids_y))
-            roi_dim_w_tgt = int(img_w * ROI_DIM_PERCENT_OF_IMAGE)
-            roi_dim_h_tgt = int(img_h * ROI_DIM_PERCENT_OF_IMAGE)
-            roi_x = max(0, int(med_cx - roi_dim_w_tgt / 2)); roi_y = max(0, int(med_cy - roi_dim_h_tgt / 2))
-            roi_w = min(roi_dim_w_tgt, img_w - roi_x); roi_h = min(roi_dim_h_tgt, img_h - roi_y)
-            if roi_w > 0 and roi_h > 0: roi_defined = True
-            else: roi_x, roi_y, roi_w, roi_h = 0, 0, img_w, img_h
-    if roi_defined: cv2.rectangle(output_display_img, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (255, 0, 255), 1)
-
+    morph_k_piece = np.ones(PIECE_MORPH_KERNEL_SIZE, np.uint8)
     raw_detected_piece_data = {}
-    search_img_mask_base = conv_img_masking[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
-    frame_debug_base = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
-    off_x, off_y = roi_x, roi_y
 
     for pid, p_attrs in config_data.items():
-        p_color_space = p_attrs['color_space']
-        orig_low_thresh = np.array(p_attrs[f'{p_color_space}_lower'])
-        orig_up_thresh = np.array(p_attrs[f'{p_color_space}_upper'])
+        # Ensure piece configuration uses HSV, otherwise, this will fail or be incorrect.
+        # The key 'color_space' in p_attrs should be 'hsv'.
+        p_color_space_key = p_attrs.get('color_space', 'hsv') # Default to hsv if not specified
+        if p_color_space_key != 'hsv':
+            print(f"WARNING: Piece {pid} has color_space '{p_color_space_key}', but only 'hsv' is fully supported in this simplified version. Attempting to use hsv_lower/hsv_upper keys.")
+            # Fallback or error: For simplicity, we assume config has 'hsv_lower' and 'hsv_upper'
+            # or that the generic keys match HSV if color_space is different but we force HSV.
+            # This part depends on strictness. Best if config aligns with 'hsv' expectation.
+
+        orig_low_thresh = np.array(p_attrs[f'{p_color_space_key}_lower'])
+        orig_up_thresh = np.array(p_attrs[f'{p_color_space_key}_upper'])
+
         tgt_verts = p_attrs['num_vertices']
         min_area, max_area = p_attrs.get('min_area', 0), p_attrs.get('max_area', float('inf'))
         tgt_area_mid = (min_area + max_area) / 2.0 if max_area != float('inf') and (min_area + max_area) > 0 else min_area * 1.5 if min_area > 0 else 1.0
-        best_poly_overall, best_mask_overall, best_score, best_relax_step = None, None, float('inf'), float('inf')
+
+        original_color_center = (orig_low_thresh + orig_up_thresh) / 2.0
+        original_color_range_half = (orig_up_thresh - orig_low_thresh) / 2.0
+        original_color_range_half[original_color_range_half == 0] = 1.0 # Avoid division by zero; treats exact value matches correctly
+
+        best_poly_in_warped_coords = None
+        best_combined_score = float('inf')
 
         for relax_step in range(MAX_RELAXATION_STEPS + 1):
             curr_low_thresh, curr_up_thresh = orig_low_thresh.copy(), orig_up_thresh.copy()
             if relax_step > 0:
-                ch0_adj = int(ch0_max * RELAX_PERCENT_INCREMENT_CH0 * relax_step)
-                ch1_adj = int(ch1_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step)
-                ch2_adj = int(ch2_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step)
+                ch0_adj = int(ch0_max * RELAX_PERCENT_INCREMENT_CH0 * relax_step) # Hue
+                ch1_adj = int(ch1_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step) # Saturation
+                ch2_adj = int(ch2_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step) # Value
+
                 curr_low_thresh -= np.array([ch0_adj, ch1_adj, ch2_adj])
                 curr_up_thresh += np.array([ch0_adj, ch1_adj, ch2_adj])
                 np.clip(curr_low_thresh, 0, None, out=curr_low_thresh)
-                curr_up_thresh[0] = min(ch0_max, curr_up_thresh[0]); curr_up_thresh[1] = min(ch1_max, curr_up_thresh[1]); curr_up_thresh[2] = min(ch2_max, curr_up_thresh[2])
+                curr_up_thresh[0] = min(ch0_max, curr_up_thresh[0])
+                curr_up_thresh[1] = min(ch1_max, curr_up_thresh[1])
+                curr_up_thresh[2] = min(ch2_max, curr_up_thresh[2])
 
-            if search_img_mask_base.size == 0: continue
-            color_mask_roi = cv2.inRange(search_img_mask_base, curr_low_thresh, curr_up_thresh)
-            opened_mask_roi = cv2.morphologyEx(color_mask_roi, cv2.MORPH_OPEN, morph_k, iterations=1)
-            proc_mask_roi = cv2.morphologyEx(opened_mask_roi, cv2.MORPH_CLOSE, morph_k, iterations=1)
+            if conv_img_masking.size == 0: continue # Should not happen if warped_frame is valid
+            color_mask = cv2.inRange(conv_img_masking, curr_low_thresh, curr_up_thresh)
+            opened_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, morph_k_piece, iterations=PIECE_MORPH_OPEN_ITERATIONS)
+            proc_mask = cv2.morphologyEx(opened_mask, cv2.MORPH_CLOSE, morph_k_piece, iterations=PIECE_MORPH_CLOSE_ITERATIONS)
 
-            if show_cv_windows and debug_pid_str == pid and frame_debug_base.size > 0 :
-                debug_mask_disp_p3 = frame_debug_base.copy(); debug_mask_disp_p3[proc_mask_roi == 0] = 0
-                title = f"F{frame_num_debug} P3 P{pid} R{relax_step}" + (" (ROI)" if roi_defined else "")
-                cv2.imshow(title, debug_mask_disp_p3)
+            if show_cv_windows and debug_pid_str == pid and warped_frame.size > 0 :
+                debug_mask_disp = warped_frame.copy(); debug_mask_disp[proc_mask == 0] = 0
+                cv2.imshow(f"F{frame_num_debug} P_WARPED P{pid} R{relax_step}", debug_mask_disp)
 
-            contours_roi, _ = cv2.findContours(proc_mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt_roi in contours_roi:
-                area_roi = cv2.contourArea(cnt_roi)
+            contours, _ = cv2.findContours(proc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
                 min_area_mult = 1 - AREA_RELAX_FACTOR_PER_STEP * relax_step
                 max_area_mult = 1 + AREA_RELAX_FACTOR_PER_STEP * relax_step
-                relaxed_min_a = max(0.0, min_area * min_area_mult); relaxed_max_a = max_area * max_area_mult
-                if not (relaxed_min_a <= area_roi <= relaxed_max_a): continue
-                peri_roi = cv2.arcLength(cnt_roi, True)
-                if peri_roi > 0:
-                    for eps in np.arange(0.01, 1.0, 0.000625):
-                        poly_roi = cv2.approxPolyDP(cnt_roi, eps * peri_roi, True)
-                        if len(poly_roi) == tgt_verts:
-                            area_diff_curr = abs(area_roi - tgt_area_mid) if tgt_area_mid > 0 else area_roi
-                            if relax_step < best_relax_step or (relax_step == best_relax_step and area_diff_curr < best_score):
-                                best_score, best_relax_step = area_diff_curr, relax_step
-                                best_poly_overall = poly_roi + np.array([off_x, off_y])
-                            break
-        if best_poly_overall is not None:
-            raw_detected_piece_data[pid] = {'poly': best_poly_overall}
-            if show_cv_windows and debug_pid_str == pid and best_mask_overall is not None:
-                 output_display_img[best_mask_overall > 0] = frame[best_mask_overall > 0]
-    return raw_detected_piece_data, output_display_img
+                relaxed_min_a = max(0.0, min_area * min_area_mult)
+                relaxed_max_a = max_area * max_area_mult
+                if not (relaxed_min_a <= area <= relaxed_max_a):
+                    continue
+
+                peri = cv2.arcLength(cnt, True)
+                if peri > 0:
+                    for eps_factor in np.arange(PIECE_EPSILON_SEARCH_START, PIECE_EPSILON_SEARCH_END, PIECE_EPSILON_SEARCH_STEP):
+                        poly = cv2.approxPolyDP(cnt, eps_factor * peri, True)
+                        if len(poly) == tgt_verts:
+                            shape_class = p_attrs.get("class_name", "Unknown")
+                            if is_shape_regular(poly, shape_class, tgt_verts):
+                                # Candidate Found - Calculate Combined Score
+                                area_diff_abs = abs(area - tgt_area_mid)
+                                normalized_area_distance = area_diff_abs / tgt_area_mid if tgt_area_mid > 0 else (0.0 if area_diff_abs == 0 else 1.0)
+
+                                contour_mask_for_avg_color = np.zeros(proc_mask.shape[:2], dtype=np.uint8)
+                                cv2.drawContours(contour_mask_for_avg_color, [cnt], -1, 255, -1)
+                                avg_color_tuple = cv2.mean(conv_img_masking, mask=contour_mask_for_avg_color)
+                                avg_color_piece = np.array(avg_color_tuple[:3]) # H, S, V
+
+                                color_distances_per_channel = np.zeros(3)
+                                color_distances_per_channel[0] = get_hue_distance(avg_color_piece[0], original_color_center[0], ch0_max)
+                                color_distances_per_channel[1] = abs(avg_color_piece[1] - original_color_center[1])
+                                color_distances_per_channel[2] = abs(avg_color_piece[2] - original_color_center[2])
+
+                                normalized_color_distances_per_channel = color_distances_per_channel / original_color_range_half
+                                normalized_color_distances_per_channel = np.nan_to_num(normalized_color_distances_per_channel, nan=1.0) # Handle potential division by zero if range_half was 0 and somehow not caught
+                                normalized_color_distances_per_channel = np.clip(normalized_color_distances_per_channel, 0.0, 1.0)
+                                normalized_color_distance_avg = np.mean(normalized_color_distances_per_channel)
+
+                                current_combined_score = (WEIGHT_COLOR_CLOSENESS * normalized_color_distance_avg +
+                                                          WEIGHT_AREA_CLOSENESS * normalized_area_distance)
+
+                                if current_combined_score < best_combined_score:
+                                    best_combined_score = current_combined_score
+                                    best_poly_in_warped_coords = extrude_polygon_corners(poly, PIECE_CORNER_EXTRUSION_PIXELS)
+                                break # Found a suitable polygon for this contour, evaluate its score
+                        elif len(poly) < tgt_verts:
+                            break # approxPolyDP will only reduce vertices
+
+        if best_poly_in_warped_coords is not None:
+            raw_detected_piece_data[pid] = {
+                'poly': best_poly_in_warped_coords,
+                'score': best_combined_score # Optionally store the score for debugging or advanced logic
+            }
+    return raw_detected_piece_data
 
 def get_default_piece_state():
-    return {
-        'status': 'UNSEEN',
-        'candidate_poly': None,
-        'candidate_recent_detections': [],
-        'locked_poly': None,
-        'frames_unseen_at_locked_pos': 0
-    }
+    return {'status': 'UNSEEN', 'candidate_poly': None, 'candidate_recent_detections': [], 'locked_poly': None, 'frames_unseen_at_locked_pos': 0}
 
 def main():
-    parser = argparse.ArgumentParser(description="Tangram detection with revised temporal persistence.")
-    parser.add_argument("--video", required=True, help="Input video file.")
-    parser.add_argument("--config", required=True, help="JSON config file.")
-    parser.add_argument("--output_json", required=True, help="Output JSON file.")
-    parser.add_argument("--debug_piece_id", type=str, default=None, help="ID for debug masks.")
-    parser.add_argument("--no_display", action="store_true", help="Disable OpenCV display.")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose console logs.")
-    parser.add_argument("--realtime", action="store_true", help="Playback video in real-time (if display is enabled).")
+    parser = argparse.ArgumentParser(description="Tangram detection with table warping and temporal persistence.")
+    parser.add_argument("--video", required=True); parser.add_argument("--config", required=True)
+    parser.add_argument("--output_json", required=True); parser.add_argument("--debug_piece_id", type=str, default=None)
+    parser.add_argument("--no_display", action="store_true"); parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--realtime", action="store_true")
     args = parser.parse_args()
-
     start_processing_time = time.time()
-    with open(args.config, 'r') as f: config_data_content = json.load(f)
-
+    with open(args.config, 'r') as f: tangram_config_data = json.load(f)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened(): print(f"Error: Cannot open video {args.video}"); return
-
     fps = cap.get(cv2.CAP_PROP_FPS); fps = fps if fps > 0 else 30.0
-
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
+    frame_width_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); frame_height_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    ret_first, first_frame = cap.read()
+    if not ret_first: print("Error: Could not read the first frame."); cap.release(); return
+    perspective_M, inverse_perspective_M, warp_width, warp_height, table_outline_pts_orig = initialize_table_warp_parameters(first_frame)
+    if perspective_M is None or inverse_perspective_M is None: print("Exiting: table warp init failed."); cap.release(); return
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rewind to start
     confirmation_window_frames = int(CONFIRM_STABLE_DURATION_S * fps)
-
     confirmation_min_positive_detections = 0
-    if confirmation_window_frames > 0 :
+    if confirmation_window_frames > 0:
         confirmation_min_positive_detections = int(confirmation_window_frames * (CONFIRM_MIN_PERCENT_VISIBLE / 100.0))
-        if confirmation_min_positive_detections == 0 and CONFIRM_MIN_PERCENT_VISIBLE > 0:
-             confirmation_min_positive_detections = 1
-    elif CONFIRM_STABLE_DURATION_S > 0 and CONFIRM_MIN_PERCENT_VISIBLE > 0 :
-        confirmation_min_positive_detections = 1
-
-
-    frames_data_for_json = []
-    piece_states = {pid: get_default_piece_state() for pid in config_data_content}
-    frame_idx = 0
-    total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
+        if confirmation_min_positive_detections == 0 and CONFIRM_MIN_PERCENT_VISIBLE > 0: confirmation_min_positive_detections = 1
+    elif CONFIRM_STABLE_DURATION_S > 0 and CONFIRM_MIN_PERCENT_VISIBLE > 0: confirmation_min_positive_detections = 1 # If duration_s leads to 0 frames, still need 1 detection
+    
+    frames_data_for_json = []; piece_states = {pid: get_default_piece_state() for pid in tangram_config_data}
+    frame_idx = 0; total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
     while cap.isOpened():
-        loop_start_time = time.time()
-        ret, frame = cap.read()
+        loop_start_time = time.time(); ret, current_frame_orig = cap.read()
         if not ret: break
         current_frame_timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-
         if args.verbose or (frame_idx > 0 and frame_idx % 30 == 0):
-            prog_str = f"Processing Frame {frame_idx}"
-            if total_frames_video > 0: prog_str += f" / {total_frames_video -1}"
-            print(prog_str)
-
-        raw_detections, output_display_img_base = process_single_frame(
-            frame.copy(), config_data_content, args.debug_piece_id, not args.no_display, frame_idx
-        )
-
+            print(f"Processing Frame {frame_idx}" + (f" / {total_frames_video -1}" if total_frames_video > 0 else ""))
+        
+        current_warped_frame = cv2.warpPerspective(current_frame_orig, perspective_M, (warp_width, warp_height))
+        raw_detections_in_warped = process_tangrams_in_warped_frame(current_warped_frame, tangram_config_data, args.debug_piece_id, not args.no_display, frame_idx)
+        
+        display_original_output = current_frame_orig.copy()
+        if table_outline_pts_orig is not None: cv2.polylines(display_original_output, [table_outline_pts_orig], True, TABLE_OUTLINE_COLOR_BGR, TABLE_OUTLINE_THICKNESS)
+        
         current_frame_output_pieces_list = []
-
-        for piece_id, piece_cfg in config_data_content.items():
-            state = piece_states[piece_id]
-            raw_poly_data = raw_detections.get(piece_id)
-            raw_poly = raw_poly_data['poly'] if raw_poly_data else None
-            output_poly_for_this_piece = None
+        for piece_id, piece_cfg in tangram_config_data.items():
+            state = piece_states[piece_id]; raw_poly_data = raw_detections_in_warped.get(piece_id)
+            raw_poly_warped = raw_poly_data['poly'] if raw_poly_data else None
+            output_poly_for_this_piece_original_coords = None
 
             if state['status'] == 'UNSEEN':
-                if raw_poly is not None:
-                    state['status'] = 'CONFIRMING'
-                    state['candidate_poly'] = raw_poly
-                    state['candidate_recent_detections'] = [True]
-                    if confirmation_window_frames == 0 and 1 >= confirmation_min_positive_detections:
-                        state['status'] = 'LOCKED'
-                        state['locked_poly'] = state['candidate_poly']
-                        state['frames_unseen_at_locked_pos'] = 0
-                        state['candidate_poly'] = None
-                        state['candidate_recent_detections'] = []
-
-            if state['status'] == 'CONFIRMING':
-                if raw_poly is not None:
-                    if state['candidate_poly'] is None:
-                        state['candidate_poly'] = raw_poly
-                        state['candidate_recent_detections'] = [True]
-                    elif compare_polys_for_stability(raw_poly, state['candidate_poly']):
-                        state['candidate_recent_detections'].append(True)
+                if raw_poly_warped is not None:
+                    state.update({'status': 'CONFIRMING', 'candidate_poly': raw_poly_warped, 'candidate_recent_detections': [True]})
+                    if confirmation_window_frames == 0 and 1 >= confirmation_min_positive_detections: # Immediate lock if no confirmation window needed
+                        state.update({'status': 'LOCKED', 'locked_poly': state['candidate_poly'], 'frames_unseen_at_locked_pos': 0, 'candidate_poly': None, 'candidate_recent_detections': []})
+            elif state['status'] == 'CONFIRMING':
+                is_stable_candidate = False
+                if raw_poly_warped is not None:
+                    if state['candidate_poly'] is None or not compare_polys_for_stability(raw_poly_warped, state['candidate_poly']):
+                        state.update({'candidate_poly': raw_poly_warped, 'candidate_recent_detections': [True]}) # New candidate
                     else:
-                        state['candidate_poly'] = raw_poly
-                        state['candidate_recent_detections'] = [True]
-                else:
-                    if state['candidate_poly'] is not None:
-                        state['candidate_recent_detections'].append(False)
-
+                        state['candidate_recent_detections'].append(True) # Stable candidate seen again
+                        is_stable_candidate = True
+                elif state['candidate_poly'] is not None: # Candidate not seen this frame
+                    state['candidate_recent_detections'].append(False)
+                
+                # Trim buffer
                 while len(state['candidate_recent_detections']) > confirmation_window_frames and confirmation_window_frames > 0:
                     state['candidate_recent_detections'].pop(0)
 
-                if confirmation_window_frames == 0 and state['candidate_poly'] is not None:
-                    if 1 >= confirmation_min_positive_detections:
-                        state['status'] = 'LOCKED'
-                        state['locked_poly'] = state['candidate_poly']
-                        state['frames_unseen_at_locked_pos'] = 0
-                        state['candidate_poly'] = None
-                        state['candidate_recent_detections'] = []
-                    else:
-                        state.update(get_default_piece_state())
-                        state['status'] = 'UNSEEN'
-                elif len(state['candidate_recent_detections']) == confirmation_window_frames and \
-                     state['candidate_poly'] is not None and confirmation_window_frames > 0:
-                    positive_detections_count = sum(state['candidate_recent_detections'])
-                    if positive_detections_count >= confirmation_min_positive_detections:
-                        state['status'] = 'LOCKED'
-                        state['locked_poly'] = state['candidate_poly']
-                        state['frames_unseen_at_locked_pos'] = 0
-                        state['candidate_poly'] = None
-                        state['candidate_recent_detections'] = []
-                    else:
-                        if state['locked_poly'] is not None:
-                            state['status'] = 'LOCKED'
-                            state['candidate_poly'] = None
-                            state['candidate_recent_detections'] = []
-                        else:
-                            state.update(get_default_piece_state())
-                            state['status'] = 'UNSEEN'
+                # Check for confirmation
+                candidate_confirmed = False
+                if state['candidate_poly'] is not None: # Only confirm if there's an active candidate
+                    if confirmation_window_frames == 0: # No temporal window, 1 good detection is enough if min_pos_detect is 1
+                         candidate_confirmed = (1 >= confirmation_min_positive_detections)
+                    elif len(state['candidate_recent_detections']) == confirmation_window_frames: # Window full
+                         candidate_confirmed = (sum(state['candidate_recent_detections']) >= confirmation_min_positive_detections)
+                
+                if candidate_confirmed:
+                    state.update({'status': 'LOCKED', 'locked_poly': state['candidate_poly'], 'frames_unseen_at_locked_pos': 0, 'candidate_poly': None, 'candidate_recent_detections': []})
+                elif state['candidate_poly'] is not None: # Has candidate, but not confirmed
+                    # Reset if window full and not confirmed, or if window is 0 and not immediately confirmed
+                    window_full_not_confirmed = (confirmation_window_frames > 0 and len(state['candidate_recent_detections']) == confirmation_window_frames and not candidate_confirmed)
+                    no_window_not_confirmed = (confirmation_window_frames == 0 and not candidate_confirmed and confirmation_min_positive_detections > 0) # e.g. if min_pos_detect was > 1 (unusual for window 0)
 
-            if state['status'] == 'LOCKED':
-                output_poly_for_this_piece = state['locked_poly']
+                    if window_full_not_confirmed or no_window_not_confirmed:
+                         state.update(get_default_piece_state()); state['status'] = 'UNSEEN' # Reset
+
+            elif state['status'] == 'LOCKED':
+                locked_poly_warped = state['locked_poly']
                 seen_at_locked_pos_this_frame = False
-
-                if raw_poly is not None:
-                    if compare_polys_for_stability(raw_poly, state['locked_poly']):
+                
+                if raw_poly_warped is not None:
+                    if compare_polys_for_stability(raw_poly_warped, locked_poly_warped):
                         seen_at_locked_pos_this_frame = True
-                        state['frames_unseen_at_locked_pos'] = 0
-                        state['candidate_poly'] = None
-                        state['candidate_recent_detections'] = []
-                    else:
-                        if state['candidate_poly'] is None or \
-                           not compare_polys_for_stability(raw_poly, state['candidate_poly']):
-                            state['candidate_poly'] = raw_poly
-                            state['candidate_recent_detections'] = [True]
+                        state.update({'frames_unseen_at_locked_pos': 0, 'candidate_poly': None, 'candidate_recent_detections': []}) # Reset any relocation attempt
+                    else: # Detected a piece, but not at the locked position. Start confirming new position.
+                        if state['candidate_poly'] is None or not compare_polys_for_stability(raw_poly_warped, state['candidate_poly']):
+                            state.update({'candidate_poly': raw_poly_warped, 'candidate_recent_detections': [True]})
                         else:
                             state['candidate_recent_detections'].append(True)
                         
@@ -329,109 +423,73 @@ def main():
                             state['candidate_recent_detections'].pop(0)
 
                         reloc_candidate_confirmed = False
-                        if confirmation_window_frames == 0 and state['candidate_poly'] is not None:
-                            if 1 >= confirmation_min_positive_detections:
-                                reloc_candidate_confirmed = True
-                        elif len(state['candidate_recent_detections']) == confirmation_window_frames and \
-                             state['candidate_poly'] is not None and confirmation_window_frames > 0:
-                            if sum(state['candidate_recent_detections']) >= confirmation_min_positive_detections:
-                                reloc_candidate_confirmed = True
-                        
+                        if state['candidate_poly'] is not None:
+                            if confirmation_window_frames == 0:
+                                reloc_candidate_confirmed = (1 >= confirmation_min_positive_detections)
+                            elif len(state['candidate_recent_detections']) == confirmation_window_frames:
+                                reloc_candidate_confirmed = (sum(state['candidate_recent_detections']) >= confirmation_min_positive_detections)
+
                         if reloc_candidate_confirmed:
-                            state['locked_poly'] = state['candidate_poly']
-                            output_poly_for_this_piece = state['locked_poly']
-                            state['frames_unseen_at_locked_pos'] = 0
-                            state['candidate_poly'] = None
-                            state['candidate_recent_detections'] = []
+                            state.update({'locked_poly': state['candidate_poly'], 'frames_unseen_at_locked_pos': 0, 'candidate_poly': None, 'candidate_recent_detections': []})
+                            locked_poly_warped = state['locked_poly'] # Update for drawing this frame
                             seen_at_locked_pos_this_frame = True
-
-                else:
-                    if state['candidate_poly'] is not None:
-                        state['candidate_recent_detections'].append(False)
-                        while len(state['candidate_recent_detections']) > confirmation_window_frames and confirmation_window_frames > 0:
-                            state['candidate_recent_detections'].pop(0)
-                        
-                        if len(state['candidate_recent_detections']) == confirmation_window_frames and confirmation_window_frames > 0:
-                            if sum(state['candidate_recent_detections']) < confirmation_min_positive_detections:
-                                state['candidate_poly'] = None
-                                state['candidate_recent_detections'] = []
-                        elif confirmation_window_frames == 0 and 1 < confirmation_min_positive_detections:
-                                state['candidate_poly'] = None 
-                                state['candidate_recent_detections'] = []
-
+                        # If relocation candidate not confirmed yet, do nothing with locked_poly, it remains as is.
+                
+                elif state['candidate_poly'] is not None: # No raw detection, but had a relocation candidate
+                    state['candidate_recent_detections'].append(False) # Relocation candidate not seen
+                    while len(state['candidate_recent_detections']) > confirmation_window_frames and confirmation_window_frames > 0:
+                        state['candidate_recent_detections'].pop(0)
+                    
+                    # If relocation window is full and not confirmed, abandon relocation attempt
+                    if (confirmation_window_frames > 0 and len(state['candidate_recent_detections']) == confirmation_window_frames and sum(state['candidate_recent_detections']) < confirmation_min_positive_detections) or \
+                       (confirmation_window_frames == 0 and confirmation_min_positive_detections > 0 and not any(state['candidate_recent_detections'])): # for window 0, if it was 1 true, it would have confirmed
+                        state.update({'candidate_poly': None, 'candidate_recent_detections': []})
 
                 if not seen_at_locked_pos_this_frame:
                     state['frames_unseen_at_locked_pos'] += 1
-            
-            piece_states[piece_id] = state
-            if output_poly_for_this_piece is not None:
-                current_frame_output_pieces_list.append({
-                    "piece_id": piece_id,
-                    "color_name": piece_cfg.get("color_name", "N/A"),
-                    "class_name": piece_cfg.get("class_name", "N/A"),
-                    "vertices": output_poly_for_this_piece.reshape(-1, 2).tolist()
-                })
-                cv2.drawContours(output_display_img_base, [output_poly_for_this_piece], -1, (0, 255, 0), 2)
-                for v_x, v_y in output_poly_for_this_piece.reshape(-1, 2):
-                    cv2.circle(output_display_img_base, (int(v_x), int(v_y)), 3, (0, 0, 255), -1)
+                    # Note: Add logic here if you want to unlock after 'X' frames_unseen_at_locked_pos without a new candidate confirming.
+                    # For now, it stays locked indefinitely until a new position is confirmed.
 
-        frames_data_for_json.append({
-            "frame_index": frame_idx,
-            "frame_timestamp_ms": current_frame_timestamp_ms,
-            "pieces": current_frame_output_pieces_list
-        })
+                if locked_poly_warped is not None:
+                    poly_to_transform = locked_poly_warped.reshape(-1,1,2).astype(np.float32) if locked_poly_warped.ndim == 2 else locked_poly_warped.astype(np.float32)
+                    output_poly_for_this_piece_original_coords = cv2.perspectiveTransform(poly_to_transform, inverse_perspective_M)
 
+            piece_states[piece_id] = state # Persist state changes
+
+            if output_poly_for_this_piece_original_coords is not None:
+                current_frame_output_pieces_list.append({"piece_id": piece_id, "color_name": piece_cfg.get("color_name", "N/A"), "class_name": piece_cfg.get("class_name", "N/A"), "vertices": output_poly_for_this_piece_original_coords.reshape(-1, 2).tolist()})
+                cv2.drawContours(display_original_output, [output_poly_for_this_piece_original_coords.astype(np.int32)], -1, PIECE_LOCKED_COLOR_BGR, PIECE_LOCKED_THICKNESS)
+                for v_x, v_y in output_poly_for_this_piece_original_coords.reshape(-1, 2): cv2.circle(display_original_output, (int(v_x), int(v_y)), PIECE_VERTEX_RADIUS, PIECE_VERTEX_COLOR_BGR, -1)
+        
+        frames_data_for_json.append({"frame_index": frame_idx, "frame_timestamp_ms": current_frame_timestamp_ms, "pieces": current_frame_output_pieces_list})
+        
         if not args.no_display:
+            cv2.imshow("Tangram Detection on Original Frame", display_original_output)
             display_wait_ms = 1
             if args.realtime:
-                loop_end_time = time.time()
-                processing_time_sec = loop_end_time - loop_start_time
-                target_frame_interval_sec = 1.0 / fps if fps > 0 else 0.033
-                wait_time_sec = target_frame_interval_sec - processing_time_sec
-                if wait_time_sec > 0:
-                    display_wait_ms = int(wait_time_sec * 1000)
-                display_wait_ms = max(1, display_wait_ms)
-
-            cv2.imshow("Tangram Detection", output_display_img_base)
-            key = cv2.waitKey(display_wait_ms) & 0xFF
+                proc_time_sec = time.time() - loop_start_time; target_interval_sec = 1.0 / fps if fps > 0 else 0.033
+                wait_time_sec = target_interval_sec - proc_time_sec
+                if wait_time_sec > 0: display_wait_ms = int(wait_time_sec * 1000)
+            key = cv2.waitKey(max(1,display_wait_ms)) & 0xFF
             if key == ord('q'): break
-            if key == ord('p') and args.debug_piece_id:
-                if args.verbose: print(f"Paused on frame {frame_idx}. Press any key to resume.")
-                cv2.waitKey(0)
-
+            if key == ord('p') and args.debug_piece_id: cv2.waitKey(0) # Pause if 'p' is pressed and debugging a piece
         frame_idx += 1
 
-    cap.release()
+    cap.release();
     if not args.no_display: cv2.destroyAllWindows()
     end_processing_time = time.time()
 
     output_json_content = {
-        "metadata": {
-            "processing_start_utc": datetime.datetime.fromtimestamp(start_processing_time, datetime.timezone.utc).isoformat(),
-            "processing_duration_seconds": round(end_processing_time - start_processing_time, 3),
-            "video_file": args.video,
-            "config_file": args.config,
-            "output_file": args.output_json,
-            "total_frames_processed": frame_idx,
-            "video_fps": round(fps,2),
-            "image_width": frame_width,
-            "image_height": frame_height,
-            "command_line_args": vars(args),
-            "temporal_params": {
-                "CONFIRM_STABLE_DURATION_S": CONFIRM_STABLE_DURATION_S,
-                "CONFIRM_MIN_PERCENT_VISIBLE": CONFIRM_MIN_PERCENT_VISIBLE,
-                "POSITION_STABILITY_PX": POSITION_STABILITY_PX,
-                "AREA_STABILITY_RATIO": AREA_STABILITY_RATIO,
-                "confirmation_window_frames_calc": confirmation_window_frames,
-                "confirmation_min_positive_detections_calc": confirmation_min_positive_detections
-            }
-        },
-        "config_data_used": config_data_content,
-        "frames_data": frames_data_for_json
-    }
+        "metadata": {"processing_start_utc": datetime.datetime.fromtimestamp(start_processing_time, datetime.timezone.utc).isoformat(), "processing_duration_seconds": round(end_processing_time - start_processing_time, 3),
+                     "video_file": args.video, "config_file": args.config, "output_file": args.output_json, "total_frames_processed": frame_idx, "video_fps": round(fps,2),
+                     "original_image_width": frame_width_orig, "original_image_height": frame_height_orig, "warped_region_width": warp_width, "warped_region_height": warp_height,
+                     "command_line_args": vars(args),
+                     "table_detection_params_used": {"LOWER_HSV": TABLE_LOWER_HSV.tolist(), "UPPER_HSV": TABLE_UPPER_HSV.tolist(), "UPPER_REGION_PERCENTAGE": TABLE_REGION_UPPER_PERCENTAGE, "CORNER_EXTRUSION_PIXELS": TABLE_CORNER_EXTRUSION_PIXELS},
+                     "piece_detection_params_used":{"CORNER_EXTRUSION_PIXELS": PIECE_CORNER_EXTRUSION_PIXELS, "SHAPE_REGULARITY_MIN_ANGLE_DEG": MIN_ALLOWED_ANGLE_DEG, "SHAPE_REGULARITY_MAX_ANGLE_DEG": MAX_ALLOWED_ANGLE_DEG, "WEIGHT_COLOR_CLOSENESS": WEIGHT_COLOR_CLOSENESS, "WEIGHT_AREA_CLOSENESS": WEIGHT_AREA_CLOSENESS},
+                     "temporal_params_used": {"CONFIRM_STABLE_DURATION_S": CONFIRM_STABLE_DURATION_S, "CONFIRM_MIN_PERCENT_VISIBLE": CONFIRM_MIN_PERCENT_VISIBLE, "POSITION_STABILITY_PX": POSITION_STABILITY_PX, "AREA_STABILITY_RATIO": AREA_STABILITY_RATIO}},
+        "tangram_config_data_used": tangram_config_data, "frames_data": frames_data_for_json}
 
-    with open(args.output_json, 'w') as f_out:
-        json.dump(output_json_content, f_out, indent=2)
+    with open(args.output_json, 'w') as f_out: json.dump(output_json_content, f_out, indent=2)
     print(f"\nProcessed {frame_idx} frames. Output saved to {args.output_json}")
 
 if __name__ == "__main__":

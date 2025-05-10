@@ -3,7 +3,6 @@ import numpy as np
 import json
 import argparse
 import os
-import time
 
 COLOR_MAP = {
     "red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 255, 0),
@@ -12,8 +11,6 @@ COLOR_MAP = {
     "lime": (0, 255, 128), "teal": (128, 128, 0), "brown": (42, 42, 165),
     "default": (200, 200, 200)
 }
-OUTLINE_COLOR = (50, 50, 50)
-OUTLINE_THICKNESS = 2
 
 def get_piece_color(color_name_str):
     return COLOR_MAP.get(color_name_str.lower(), COLOR_MAP["default"])
@@ -68,11 +65,11 @@ def main():
             print(f"Error: Background video file not found at {args.video_bg}.")
             return
     else: # No --video_bg, rely on JSON metadata
-        if "image_width" not in metadata or "image_height" not in metadata:
-            print("Error: 'image_width' and/or 'image_height' not found in JSON metadata, and no --video_bg provided.")
+        if "original_image_width" not in metadata or "original_image_height" not in metadata:
+            print("Error: 'original_image_width' and/or 'original_image_height' not found in JSON metadata, and no --video_bg provided.")
             return
-        canvas_width = metadata["image_width"]
-        canvas_height = metadata["image_height"]
+        canvas_width = metadata["original_image_width"]
+        canvas_height = metadata["original_image_height"]
 
         if "video_fps" not in metadata:
             print("Error: 'video_fps' not found in JSON metadata, and no --video_bg provided.")
@@ -81,7 +78,7 @@ def main():
 
         if not isinstance(canvas_width, int) or canvas_width <= 0 or \
            not isinstance(canvas_height, int) or canvas_height <= 0:
-            print(f"Error: Invalid 'image_width' or 'image_height' ({canvas_width}x{canvas_height}) in JSON metadata.")
+            print(f"Error: Invalid 'original_image_width' or 'original_image_height' ({canvas_width}x{canvas_height}) in JSON metadata.")
             return
         if not isinstance(video_fps, (int, float)) or video_fps <= 0:
             print(f"Error: Invalid 'video_fps' ({video_fps}) in JSON metadata.")
@@ -120,7 +117,8 @@ def main():
                 fill_color = get_piece_color(color_name)
 
                 cv2.fillPoly(display_frame, [pts], fill_color)
-                cv2.polylines(display_frame, [pts], isClosed=True, color=OUTLINE_COLOR, thickness=OUTLINE_THICKNESS)
+                # Removed the outline drawing:
+                # cv2.polylines(display_frame, [pts], isClosed=True, color=OUTLINE_COLOR, thickness=OUTLINE_THICKNESS)
 
         cv2.imshow("Tangram Replay", display_frame)
         key = cv2.waitKey(delay_ms) & 0xFF

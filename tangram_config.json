@@ -10,8 +10,8 @@
       185,
       255
     ],
-    "min_area": 17,
-    "max_area": 41,
+    "min_area": 25,
+    "max_area": 50,
     "num_vertices": 3,
     "color_name": "Pink",
     "class_name": "Triangle",
@@ -28,8 +28,8 @@
       255,
       255
     ],
-    "min_area": 57,
-    "max_area": 134,
+    "min_area": 60,
+    "max_area": 150,
     "num_vertices": 3,
     "color_name": "Red",
     "class_name": "Triangle",
@@ -47,7 +47,7 @@
       255
     ],
     "min_area": 70,
-    "max_area": 164,
+    "max_area": 170,
     "num_vertices": 3,
     "color_name": "Orange",
     "class_name": "Triangle",
@@ -64,8 +64,8 @@
       136,
       196
     ],
-    "min_area": 22,
-    "max_area": 53,
+    "min_area": 25,
+    "max_area": 50,
     "num_vertices": 3,
     "color_name": "Blue",
     "class_name": "Triangle",
@@ -82,8 +82,8 @@
       93,
       134
     ],
-    "min_area": 62,
-    "max_area": 146,
+    "min_area": 90,
+    "max_area": 200,
     "num_vertices": 3,
     "color_name": "Green",
     "class_name": "Triangle",
@@ -92,16 +92,16 @@
   "6": {
     "hsv_lower": [
       20,
-      56,
+      30,
       189
     ],
     "hsv_upper": [
-      27,
-      143,
+      179,
+      190,
       255
     ],
     "min_area": 50,
-    "max_area": 116,
+    "max_area": 150,
     "num_vertices": 4,
     "color_name": "Yellow",
     "class_name": "Square",
@@ -118,8 +118,8 @@
       63,
       157
     ],
-    "min_area": 63,
-    "max_area": 149,
+    "min_area": 50,
+    "max_area": 160,
     "num_vertices": 4,
     "color_name": "Purple",
     "class_name": "Parallelogram",
