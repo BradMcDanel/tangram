@@ -12,6 +12,8 @@ COLOR_MAP = {
     "default": (200, 200, 200)
 }
 
+PIECE_ALPHA = 0.6 # Adjust as needed
+
 def get_piece_color(color_name_str):
     return COLOR_MAP.get(color_name_str.lower(), COLOR_MAP["default"])
 
@@ -19,12 +21,17 @@ def main():
     parser = argparse.ArgumentParser(description="Replay tangram detections from an output JSON file.")
     parser.add_argument("--json_file", required=True, help="Path to the output JSON file from the detector.")
     parser.add_argument("--video_bg", type=str, default=None, help="Optional: Path to the original video for background. If not provided, a blank canvas is used, and dimensions/FPS must be in the JSON.")
-    parser.add_argument("--speed_factor", type=float, default=1.0, help="Playback speed factor (e.g., 1.0 for normal, 2.0 for 2x speed, 0.5 for half speed).")
-    parser.add_argument("--start_frame", type=int, default=0, help="Frame index to start replay from.")
+    parser.add_argument("--speed_factor", type=float, default=1.0, help="Playback speed factor for display, or speed adjustment for output video.")
+    parser.add_argument("--start_frame", type=int, default=0, help="Frame index to start replay/processing from.")
+    parser.add_argument("--output_video_path", type=str, default=None, help="Optional: Path to save the output as a video file. If provided, display is skipped.")
     args = parser.parse_args()
 
     if not os.path.exists(args.json_file):
         print(f"Error: JSON file not found at {args.json_file}")
+        return
+
+    if args.speed_factor <= 0:
+        print(f"Error: --speed_factor must be positive. Got {args.speed_factor}")
         return
 
     with open(args.json_file, 'r') as f:
@@ -37,10 +44,8 @@ def main():
         print("Error: No frame data found in the JSON file.")
         return
 
-    canvas_width = None
-    canvas_height = None
-    video_fps = None
-    cap_bg = None
+    canvas_width, canvas_height, base_video_fps = None, None, None
+    cap_bg, video_out = None, None
 
     if args.video_bg:
         if os.path.exists(args.video_bg):
@@ -48,91 +53,155 @@ def main():
             if not cap_bg.isOpened():
                 print(f"Error: Could not open background video {args.video_bg}.")
                 return
-            
             canvas_width = int(cap_bg.get(cv2.CAP_PROP_FRAME_WIDTH))
             canvas_height = int(cap_bg.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            video_fps = cap_bg.get(cv2.CAP_PROP_FPS)
-
-            if canvas_width <= 0 or canvas_height <= 0:
-                print(f"Error: Invalid dimensions ({canvas_width}x{canvas_height}) from video file {args.video_bg}.")
-                if cap_bg: cap_bg.release()
-                return
-            if video_fps <= 0:
-                print(f"Error: Invalid FPS ({video_fps}) from video file {args.video_bg}.")
+            base_video_fps = cap_bg.get(cv2.CAP_PROP_FPS)
+            if not (canvas_width > 0 and canvas_height > 0 and base_video_fps > 0):
+                print(f"Error: Invalid video properties from {args.video_bg}.")
                 if cap_bg: cap_bg.release()
                 return
         else:
             print(f"Error: Background video file not found at {args.video_bg}.")
             return
-    else: # No --video_bg, rely on JSON metadata
-        if "original_image_width" not in metadata or "original_image_height" not in metadata:
-            print("Error: 'original_image_width' and/or 'original_image_height' not found in JSON metadata, and no --video_bg provided.")
+    else:
+        required_meta = ["original_image_width", "original_image_height", "video_fps"]
+        if not all(k in metadata for k in required_meta):
+            print(f"Error: Missing required metadata ({', '.join(required_meta)}) in JSON, and no --video_bg provided.")
             return
         canvas_width = metadata["original_image_width"]
         canvas_height = metadata["original_image_height"]
-
-        if "video_fps" not in metadata:
-            print("Error: 'video_fps' not found in JSON metadata, and no --video_bg provided.")
-            return
-        video_fps = metadata["video_fps"]
-
-        if not isinstance(canvas_width, int) or canvas_width <= 0 or \
-           not isinstance(canvas_height, int) or canvas_height <= 0:
-            print(f"Error: Invalid 'original_image_width' or 'original_image_height' ({canvas_width}x{canvas_height}) in JSON metadata.")
-            return
-        if not isinstance(video_fps, (int, float)) or video_fps <= 0:
-            print(f"Error: Invalid 'video_fps' ({video_fps}) in JSON metadata.")
+        base_video_fps = metadata["video_fps"]
+        if not (isinstance(canvas_width, int) and canvas_width > 0 and
+                isinstance(canvas_height, int) and canvas_height > 0 and
+                isinstance(base_video_fps, (int, float)) and base_video_fps > 0):
+            print("Error: Invalid metadata values for dimensions or FPS.")
             return
 
-    delay_ms = int((1.0 / (video_fps * args.speed_factor)) * 1000)
-    if delay_ms <= 0: delay_ms = 1
+    display_delay_ms = 1
+    if args.output_video_path:
+        output_fps = base_video_fps * args.speed_factor
+        if output_fps <= 0:
+            print(f"Error: Calculated output FPS ({output_fps}) is not positive.")
+            if cap_bg: cap_bg.release()
+            return
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        if args.output_video_path.lower().endswith(".avi"):
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        video_out = cv2.VideoWriter(args.output_video_path, fourcc, output_fps, (canvas_width, canvas_height))
+        if not video_out.isOpened():
+            print(f"Error: Could not open video writer for {args.output_video_path}")
+            if cap_bg: cap_bg.release()
+            return
+        print(f"Outputting to video: {args.output_video_path} at {output_fps:.2f} FPS.")
+    else:
+        effective_display_fps = base_video_fps * args.speed_factor
+        display_delay_ms = int((1.0 / effective_display_fps) * 1000)
+        if display_delay_ms <= 0: display_delay_ms = 1
+        print(f"Displaying replay at effective {effective_display_fps:.2f} FPS (delay: {display_delay_ms}ms).")
 
     current_json_frame_index = 0
+    processed_frames_count = 0
     
     if cap_bg and args.start_frame > 0:
-        cap_bg.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+        if not cap_bg.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame):
+            print(f"Warning: Could not seek background video to frame {args.start_frame}.")
 
     while current_json_frame_index < len(frames_data):
         frame_info = frames_data[current_json_frame_index]
+        json_frame_id = frame_info.get("frame_index", -1)
         
-        if frame_info.get("frame_index", -1) < args.start_frame:
-            current_json_frame_index +=1
+        if json_frame_id < args.start_frame:
+            current_json_frame_index += 1
             continue
 
+        # 1. Get Base Background for the current frame iteration
+        base_frame_this_iteration = None
         if cap_bg:
-            ret_bg, bg_frame = cap_bg.read()
-            if not ret_bg:
-                print("End of background video or error reading frame.")
-                break 
-            display_frame = bg_frame.copy()
-        else:
-            display_frame = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+            current_video_frame_pos = int(cap_bg.get(cv2.CAP_PROP_POS_FRAMES))
+            # Skip video frames if JSON is ahead
+            while current_video_frame_pos < json_frame_id:
+                ret_skip, _ = cap_bg.read()
+                if not ret_skip: # Video ended while trying to skip
+                    print(f"End of background video while skipping to sync with JSON frame {json_frame_id}.")
+                    cap_bg.release() # Ensure it's released
+                    cap_bg = None # Mark as unusable
+                    break 
+                current_video_frame_pos = int(cap_bg.get(cv2.CAP_PROP_POS_FRAMES))
+            
+            if cap_bg: # Check if video didn't end during skip
+                ret_bg, bg_frame_from_video = cap_bg.read()
+                if not ret_bg:
+                    print(f"End of background video or error reading frame for JSON frame {json_frame_id}.")
+                    break 
+                base_frame_this_iteration = bg_frame_from_video.copy()
+            else: # Video ended during skip, cannot proceed with background
+                base_frame_this_iteration = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+
+        else: # No background video specified
+            base_frame_this_iteration = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+
+        # 2. Initialize Final Display Frame for this iteration
+        # This starts as a copy of the base background and will have pieces blended onto it.
+        display_frame = base_frame_this_iteration.copy()
 
         pieces_in_frame = frame_info.get("pieces", [])
         for piece in pieces_in_frame:
             vertices = piece.get("vertices", [])
             if vertices:
-                pts = np.array(vertices, dtype=np.int32).reshape((-1, 1, 2))
+                pts_np = np.array(vertices, dtype=np.int32) # Shape (N, 2)
                 color_name = piece.get("color_name", "default")
-                fill_color = get_piece_color(color_name)
+                fill_color_bgr = get_piece_color(color_name)
+                
+                # Create a mask for the current piece (single channel)
+                piece_mask = np.zeros(base_frame_this_iteration.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(piece_mask, [pts_np.reshape((-1, 1, 2))], 255) # Draw piece as white on black mask
+                
+                # Get coordinates where the current piece exists
+                roi_rows, roi_cols = np.where(piece_mask == 255)
+                
+                if roi_rows.size > 0: # If the piece has any area
+                    # Get original background pixels under the current piece
+                    bg_pixels_roi = base_frame_this_iteration[roi_rows, roi_cols].astype(np.float32)
+                    
+                    # Piece color (as float for blending)
+                    piece_color_float = np.array(fill_color_bgr, dtype=np.float32) # Shape (3,)
+                    
+                    # Alpha blending: NewPixel = PieceColor * alpha + BackgroundPixel * (1-alpha)
+                    blended_pixels = piece_color_float * PIECE_ALPHA + bg_pixels_roi * (1.0 - PIECE_ALPHA)
+                    
+                    # Update the display_frame in the ROI for this piece
+                    display_frame[roi_rows, roi_cols] = blended_pixels.astype(np.uint8)
 
-                cv2.fillPoly(display_frame, [pts], fill_color)
-                # Removed the outline drawing:
-                # cv2.polylines(display_frame, [pts], isClosed=True, color=OUTLINE_COLOR, thickness=OUTLINE_THICKNESS)
+        if video_out:
+            video_out.write(display_frame)
+        else:
+            cv2.imshow("Tangram Replay", display_frame)
+        
+        processed_frames_count += 1
+        if processed_frames_count % 100 == 0 and args.output_video_path:
+            print(f"Processed {processed_frames_count} frames for video output...")
 
-        cv2.imshow("Tangram Replay", display_frame)
-        key = cv2.waitKey(delay_ms) & 0xFF
+        key_wait_duration = 1 if video_out else display_delay_ms
+        key = cv2.waitKey(key_wait_duration) & 0xFF
+        
         if key == ord('q'):
+            print("Quitting...")
             break
-        elif key == ord(' '): 
+        elif not video_out and key == ord(' '): 
+            print("Paused. Press any key to continue...")
             cv2.waitKey(0) 
         
         current_json_frame_index +=1
 
     if cap_bg:
         cap_bg.release()
-    cv2.destroyAllWindows()
-    print("Replay finished.")
+    if video_out:
+        video_out.release()
+        print(f"Video successfully saved to {args.output_video_path}")
+    if not args.output_video_path: 
+        cv2.destroyAllWindows()
+        
+    print(f"Processing finished. {processed_frames_count} frames handled.")
 
 if __name__ == "__main__":
     main()
