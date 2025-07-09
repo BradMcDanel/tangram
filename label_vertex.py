@@ -15,7 +15,7 @@ import shutil
 # --- Configuration ---
 VERTEX_BBOX_SIZE = 4  # Size in pixels (e.g., 4 means a 4x4 box). An even number is best.
 DEFAULT_VIDEO_DIR = "data/videos"
-DEFAULT_OUTPUT_DIR = "yolo_vertex_dataset"
+DEFAULT_OUTPUT_DIR = "data/training/vertex"
 DEFAULT_FRAMES_PER_VIDEO = 10
 
 # --- NEW: Configuration for Annotation View ---

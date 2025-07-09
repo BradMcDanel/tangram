@@ -292,7 +292,7 @@ def print_instructions(class_map):
 def main():
     parser = argparse.ArgumentParser(description="Interactive SAM2 labeling pipeline for YOLO.")
     parser.add_argument("--video_dir", default="data/videos", help="Directory with input .mp4 files.")
-    parser.add_argument("--output_dir", default="yolo_dataset", help="Directory to save the final YOLO dataset.")
+    parser.add_argument("--output_dir", default="data/training/bbox", help="Directory to save the final YOLO dataset.")
     parser.add_argument("--frames_per_video", type=int, default=10, help="Number of frames to extract per video.")
     parser.add_argument("--sam_checkpoint", default=DEFAULT_SAM2_CHECKPOINT, help="Path to SAM 2 model checkpoint.")
     parser.add_argument("--sam_config", default=DEFAULT_MODEL_CONFIG_NAME, help="Path to SAM 2 model config yaml.")

@@ -364,9 +364,13 @@ class VertexPredictor:
         self.model.eval()
 
 
+import json
+import time
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", required=True)
+    parser.add_argument("--output-json", help="Path to save the output JSON file.")
     args = parser.parse_args()
     
     model = YOLO(DEFAULT_YOLO_MODEL)
@@ -380,9 +384,14 @@ def main():
         sys.exit(1)
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    frames_data = []
+    start_time = time.time()
+
     print("--- Press 'q' in the display window to quit. ---")
     
-    for _ in tqdm(range(total_frames), desc="Processing", unit="frame"):
+    for frame_index in tqdm(range(total_frames), desc="Processing", unit="frame"):
         ret, frame = cap.read()
         if not ret:
             break
@@ -398,7 +407,6 @@ def main():
             confidence = float(box.conf[0])
             bbox = tuple(map(int, box.xyxy[0]))
             
-            # Apply size constraint - skip detections that are too large
             if not is_valid_piece_size(bbox, MAX_PIECE_SIZE):
                 continue
             
@@ -413,33 +421,39 @@ def main():
         
         stabilized_detections = stabilizer.update(best_detections_by_class, frame)
         
-        # --- Draw on both views ---
+        frame_pieces = []
         for det in stabilized_detections.values():
+            piece_data = {
+                "class_name": det['class_name'],
+                "vertices": det.get('vertices', [])
+            }
+            frame_pieces.append(piece_data)
+
             bbox = det['bbox']
             class_name = det['class_name']
             color = PIECE_COLORS.get(class_name, (255, 255, 255))
-            
-            # Get the vertices to be drawn
             drawable_vertices = det.get('vertices', [])
             
             if class_name in ['yellow_square', 'purple_parallelogram'] and len(drawable_vertices) == 4:
                 drawable_vertices = order_vertices_for_polygon(drawable_vertices)
             
-            # Draw on the original frame
             cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, BOX_THICKNESS)
             for vx, vy in drawable_vertices:
                 cv2.circle(frame, (vx, vy), 3, color, -1)
 
-            # Draw on the reconstruction view
             if len(drawable_vertices) >= 3:
                 overlay = reconstruction_view.copy()
                 pts = np.array(drawable_vertices, np.int32).reshape((-1, 1, 2))
                 cv2.fillPoly(overlay, [pts], color)
                 cv2.addWeighted(overlay, TRANSPARENCY_ALPHA, reconstruction_view, 1 - TRANSPARENCY_ALPHA, 0, reconstruction_view)
-                
-                # Draw the vertices on top (fully opaque)
                 for vx, vy in drawable_vertices:
                     cv2.circle(reconstruction_view, (vx, vy), 1, color, -1)
+        
+        frames_data.append({
+            "frame_index": frame_index,
+            "frame_timestamp_ms": (frame_index / fps) * 1000,
+            "pieces": frame_pieces
+        })
         
         combined_view = np.hstack((frame, reconstruction_view))
         cv2.imshow("Tangram Detection", combined_view)
@@ -448,6 +462,25 @@ def main():
     
     cap.release()
     cv2.destroyAllWindows()
+
+    processing_duration_seconds = time.time() - start_time
+    
+    if args.output_json:
+        output_data = {
+            "metadata": {
+                "processing_start_utc": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(start_time)),
+                "processing_duration_seconds": processing_duration_seconds,
+                "video_file": args.video,
+                "total_frames_processed": len(frames_data),
+                "video_fps": fps,
+                "command_line_args": vars(args)
+            },
+            "frames_data": frames_data
+        }
+        with open(args.output_json, 'w') as f:
+            json.dump(output_data, f, indent=2)
+        print(f"--- Output saved to {args.output_json} ---")
+
     print("--- Processing complete. ---")
 
 if __name__ == "__main__":
