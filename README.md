@@ -71,11 +71,3 @@ Detection results are saved as JSON with frame-by-frame data:
   ]
 }
 ```
-
-## Detected Pieces
-
-- `pink_triangle`, `red_triangle` - Large triangles
-- `orange_triangle` - Medium triangle  
-- `blue_triangle`, `green_triangle` - Small triangles
-- `yellow_square` - Square
-- `purple_parallelogram` - Parallelogram
