@@ -3,19 +3,9 @@ import numpy as np
 import json
 import argparse
 import os
-
-COLOR_MAP = {
-    "red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 255, 0),
-    "yellow": (0, 255, 255), "orange": (0, 165, 255), "purple": (128, 0, 128),
-    "pink": (203, 192, 255), "cyan": (255, 255, 0), "magenta": (255, 0, 255),
-    "lime": (0, 255, 128), "teal": (128, 128, 0), "brown": (42, 42, 165),
-    "default": (200, 200, 200)
-}
+from visualization_utils import draw_piece_filled, get_piece_color
 
 PIECE_ALPHA = 0.6 # Adjust as needed
-
-def get_piece_color(color_name_str):
-    return COLOR_MAP.get(color_name_str.lower(), COLOR_MAP["default"])
 
 def main():
     parser = argparse.ArgumentParser(description="Replay tangram detections from an output JSON file.")
@@ -146,31 +136,8 @@ def main():
 
         pieces_in_frame = frame_info.get("pieces", [])
         for piece in pieces_in_frame:
-            vertices = piece.get("vertices", [])
-            if vertices:
-                pts_np = np.array(vertices, dtype=np.int32) # Shape (N, 2)
-                color_name = piece.get("color_name", "default")
-                fill_color_bgr = get_piece_color(color_name)
-                
-                # Create a mask for the current piece (single channel)
-                piece_mask = np.zeros(base_frame_this_iteration.shape[:2], dtype=np.uint8)
-                cv2.fillPoly(piece_mask, [pts_np.reshape((-1, 1, 2))], 255) # Draw piece as white on black mask
-                
-                # Get coordinates where the current piece exists
-                roi_rows, roi_cols = np.where(piece_mask == 255)
-                
-                if roi_rows.size > 0: # If the piece has any area
-                    # Get original background pixels under the current piece
-                    bg_pixels_roi = base_frame_this_iteration[roi_rows, roi_cols].astype(np.float32)
-                    
-                    # Piece color (as float for blending)
-                    piece_color_float = np.array(fill_color_bgr, dtype=np.float32) # Shape (3,)
-                    
-                    # Alpha blending: NewPixel = PieceColor * alpha + BackgroundPixel * (1-alpha)
-                    blended_pixels = piece_color_float * PIECE_ALPHA + bg_pixels_roi * (1.0 - PIECE_ALPHA)
-                    
-                    # Update the display_frame in the ROI for this piece
-                    display_frame[roi_rows, roi_cols] = blended_pixels.astype(np.uint8)
+            # Use the shared visualization function
+            draw_piece_filled(display_frame, piece, PIECE_ALPHA)
 
         if video_out:
             video_out.write(display_frame)

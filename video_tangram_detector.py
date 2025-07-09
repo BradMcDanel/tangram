@@ -11,6 +11,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from scipy.ndimage import maximum_filter
 from train_unet import UNet
+from visualization_utils import draw_piece_on_frame, create_reconstruction_view
 
 # Model paths
 DEFAULT_YOLO_MODEL = os.path.expanduser("yolo.pt")
@@ -31,20 +32,7 @@ MISSING_FRAMES_THRESHOLD = 60      # Remove piece after this many missing frames
 MIN_VERTEX_VALIDATION_FRAMES = 45  # Minimum frames with correct vertices to stabilize
 VERTEX_HEATMAP_WINDOW = 60         # Sliding window size for heatmap accumulation
 
-# UI
-BOX_THICKNESS = 1
-TRANSPARENCY_ALPHA = 0.6
 
-# Color mapping for each piece (BGR format for OpenCV)
-PIECE_COLORS = {
-    'pink_triangle': (203, 192, 255),
-    'red_triangle': (0, 0, 255),
-    'orange_triangle': (0, 165, 255),
-    'blue_triangle': (255, 144, 30),
-    'green_triangle': (0, 255, 0),
-    'yellow_square': (0, 255, 255),
-    'purple_parallelogram': (128, 0, 128)
-}
 
 # Map piece type to its expected number of vertices
 PIECE_VERTEX_COUNT = {
@@ -339,15 +327,6 @@ def is_valid_piece_size(bbox, max_size=MAX_PIECE_SIZE):
     return width <= max_size and height <= max_size
 
 
-def order_vertices_for_polygon(vertices):
-    """Sorts 4 vertices to form a convex polygon"""
-    center_x = sum(v[0] for v in vertices) / 4
-    center_y = sum(v[1] for v in vertices) / 4
-    sorted_vertices = sorted(
-        vertices,
-        key=lambda v: math.atan2(v[1] - center_y, v[0] - center_x)
-    )
-    return sorted_vertices
 
 
 class VertexPredictor:
@@ -371,6 +350,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", required=True)
     parser.add_argument("--output-json", help="Path to save the output JSON file.")
+    parser.add_argument("--no-display", action="store_true", help="Disable visualization display during processing")
     args = parser.parse_args()
     
     model = YOLO(DEFAULT_YOLO_MODEL)
@@ -389,7 +369,8 @@ def main():
     frames_data = []
     start_time = time.time()
 
-    print("--- Press 'q' in the display window to quit. ---")
+    if not args.no_display:
+        print("--- Press 'q' in the display window to quit. ---")
     
     for frame_index in tqdm(range(total_frames), desc="Processing", unit="frame"):
         ret, frame = cap.read()
@@ -425,29 +406,16 @@ def main():
         for det in stabilized_detections.values():
             piece_data = {
                 "class_name": det['class_name'],
-                "vertices": det.get('vertices', [])
+                "vertices": det.get('vertices', []),
+                "bbox": det.get('bbox', [])
             }
             frame_pieces.append(piece_data)
 
-            bbox = det['bbox']
-            class_name = det['class_name']
-            color = PIECE_COLORS.get(class_name, (255, 255, 255))
-            drawable_vertices = det.get('vertices', [])
-            
-            if class_name in ['yellow_square', 'purple_parallelogram'] and len(drawable_vertices) == 4:
-                drawable_vertices = order_vertices_for_polygon(drawable_vertices)
-            
-            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, BOX_THICKNESS)
-            for vx, vy in drawable_vertices:
-                cv2.circle(frame, (vx, vy), 3, color, -1)
-
-            if len(drawable_vertices) >= 3:
-                overlay = reconstruction_view.copy()
-                pts = np.array(drawable_vertices, np.int32).reshape((-1, 1, 2))
-                cv2.fillPoly(overlay, [pts], color)
-                cv2.addWeighted(overlay, TRANSPARENCY_ALPHA, reconstruction_view, 1 - TRANSPARENCY_ALPHA, 0, reconstruction_view)
-                for vx, vy in drawable_vertices:
-                    cv2.circle(reconstruction_view, (vx, vy), 1, color, -1)
+            # Draw piece on main frame
+            draw_piece_on_frame(frame, piece_data)
+        
+        # Create reconstruction view
+        reconstruction_view = create_reconstruction_view((h, w, 3), frame_pieces)
         
         frames_data.append({
             "frame_index": frame_index,
@@ -455,13 +423,15 @@ def main():
             "pieces": frame_pieces
         })
         
-        combined_view = np.hstack((frame, reconstruction_view))
-        cv2.imshow("Tangram Detection", combined_view)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        if not args.no_display:
+            combined_view = np.hstack((frame, reconstruction_view))
+            cv2.imshow("Tangram Detection", combined_view)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
     
     cap.release()
-    cv2.destroyAllWindows()
+    if not args.no_display:
+        cv2.destroyAllWindows()
 
     processing_duration_seconds = time.time() - start_time
     
