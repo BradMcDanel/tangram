@@ -60,7 +60,7 @@ def draw_piece_on_frame(frame, piece_data, show_bbox=True, show_vertices=True):
             drawable_vertices = order_vertices_for_polygon(drawable_vertices)
         
         for vx, vy in drawable_vertices:
-            cv2.circle(frame, (vx, vy), 3, color, -1)
+            cv2.circle(frame, (vx, vy), 1, color, -1)
 
 def draw_piece_filled(frame, piece_data, alpha=TRANSPARENCY_ALPHA):
     """

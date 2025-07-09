@@ -366,13 +366,21 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     
+    # Get video dimensions from first frame
+    ret, first_frame = cap.read()
+    if not ret:
+        print("FATAL ERROR: Could not read first frame")
+        sys.exit(1)
+    frame_height, frame_width, _ = first_frame.shape
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
+    
     frames_data = []
     start_time = time.time()
 
     if not args.no_display:
         print("--- Press 'q' in the display window to quit. ---")
     
-    for frame_index in tqdm(range(total_frames), desc="Processing", unit="frame"):
+    for frame_index in tqdm(range(total_frames), desc="Processing", unit="frame", position=1, leave=False):
         ret, frame = cap.read()
         if not ret:
             break
@@ -436,6 +444,11 @@ def main():
     processing_duration_seconds = time.time() - start_time
     
     if args.output_json:
+        # Create directory if it doesn't exist
+        output_dir = os.path.dirname(args.output_json)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
         output_data = {
             "metadata": {
                 "processing_start_utc": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(start_time)),
@@ -443,7 +456,27 @@ def main():
                 "video_file": args.video,
                 "total_frames_processed": len(frames_data),
                 "video_fps": fps,
-                "command_line_args": vars(args)
+                "original_image_width": frame_width,
+                "original_image_height": frame_height,
+                "command_line_args": vars(args),
+                "detection_parameters": {
+                    "yolo_confidence_threshold": YOLO_CONFIDENCE_THRESHOLD,
+                    "max_piece_size": MAX_PIECE_SIZE,
+                    "heatmap_threshold": HEATMAP_THRESHOLD,
+                    "min_vertex_distance": MIN_VERTEX_DISTANCE,
+                    "stabilization_frames": STABILIZATION_FRAMES,
+                    "stabilization_window": STABILIZATION_WINDOW,
+                    "min_detection_rate": MIN_DETECTION_RATE,
+                    "movement_threshold": MOVEMENT_THRESHOLD,
+                    "missing_frames_threshold": MISSING_FRAMES_THRESHOLD,
+                    "min_vertex_validation_frames": MIN_VERTEX_VALIDATION_FRAMES,
+                    "vertex_heatmap_window": VERTEX_HEATMAP_WINDOW
+                },
+                "model_paths": {
+                    "yolo_model": DEFAULT_YOLO_MODEL,
+                    "unet_model": DEFAULT_UNET_MODEL
+                },
+                "piece_vertex_count": PIECE_VERTEX_COUNT
             },
             "frames_data": frames_data
         }

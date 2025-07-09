@@ -3,7 +3,7 @@ import numpy as np
 import json
 import argparse
 import os
-from visualization_utils import draw_piece_filled, get_piece_color
+from visualization_utils import draw_piece_filled, draw_piece_on_frame, create_reconstruction_view, get_piece_color
 
 PIECE_ALPHA = 0.6 # Adjust as needed
 
@@ -69,6 +69,11 @@ def main():
 
     display_delay_ms = 1
     if args.output_video_path:
+        # Create directory if it doesn't exist
+        output_dir = os.path.dirname(args.output_video_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
         output_fps = base_video_fps * args.speed_factor
         if output_fps <= 0:
             print(f"Error: Calculated output FPS ({output_fps}) is not positive.")
@@ -77,7 +82,7 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         if args.output_video_path.lower().endswith(".avi"):
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        video_out = cv2.VideoWriter(args.output_video_path, fourcc, output_fps, (canvas_width, canvas_height))
+        video_out = cv2.VideoWriter(args.output_video_path, fourcc, output_fps, (canvas_width * 2, canvas_height))
         if not video_out.isOpened():
             print(f"Error: Could not open video writer for {args.output_video_path}")
             if cap_bg: cap_bg.release()
@@ -133,16 +138,26 @@ def main():
         # 2. Initialize Final Display Frame for this iteration
         # This starts as a copy of the base background and will have pieces blended onto it.
         display_frame = base_frame_this_iteration.copy()
+        
+        # Create reconstruction view
+        reconstruction_view = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
 
         pieces_in_frame = frame_info.get("pieces", [])
         for piece in pieces_in_frame:
-            # Use the shared visualization function
-            draw_piece_filled(display_frame, piece, PIECE_ALPHA)
+            # Draw piece on main frame (with bounding boxes and vertices)
+            draw_piece_on_frame(display_frame, piece)
+            
+        # Create reconstruction view
+        reconstruction_view = create_reconstruction_view((canvas_height, canvas_width, 3), pieces_in_frame)
+        
+        # Combine both views horizontally like video_tangram_detector.py
+        combined_view = np.hstack((display_frame, reconstruction_view))
+        final_display_frame = combined_view
 
         if video_out:
-            video_out.write(display_frame)
+            video_out.write(final_display_frame)
         else:
-            cv2.imshow("Tangram Replay", display_frame)
+            cv2.imshow("Tangram Replay", final_display_frame)
         
         processed_frames_count += 1
         if processed_frames_count % 100 == 0 and args.output_video_path:
