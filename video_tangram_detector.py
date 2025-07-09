@@ -28,6 +28,7 @@ PIECE_CORNER_EXTRUSION_PIXELS = 3
 PIECE_EPSILON_SEARCH_START = 0.01
 PIECE_EPSILON_SEARCH_END = 0.1
 PIECE_EPSILON_SEARCH_STEP = 0.001
+FALLBACK_MAX_AREA_PX = 150
 
 # --- Shape Regularity Parameters ---
 MIN_ALLOWED_ANGLE_DEG = 30.0
@@ -62,6 +63,103 @@ PIECE_VERTEX_RADIUS = 1
 
 
 # --- Helper Functions ---
+def regularize_shape(polygon, shape_class_name):
+    """
+    Takes a detected polygon and returns a geometrically "perfect" version of it
+    (e.g., a true square, a true isosceles right triangle) with the same
+    centroid, area, and orientation.
+    """
+    if polygon is None or len(polygon) < 3:
+        return polygon
+
+    # Ensure polygon is in (N, 2) format
+    poly_2d = polygon.reshape(-1, 2).astype(np.float32)
+    
+    if shape_class_name == "Square" and len(poly_2d) == 4:
+        # For a square, the most robust method is to use its minimum area bounding rectangle.
+        # This gives us a stable center, size, and rotation angle.
+        # We then create a perfect square with the same area and orientation.
+        rect = cv2.minAreaRect(poly_2d)
+        (center, (width, height), angle) = rect
+        
+        # Preserve the original area
+        area = cv2.contourArea(poly_2d)
+        if area > 0:
+            side_length = np.sqrt(area)
+            # Create a new rectangle definition for a perfect square
+            square_rect = (center, (side_length, side_length), angle)
+            # Get the 4 corners of this new perfect square
+            box_pts = cv2.boxPoints(square_rect)
+            # Return it in the same format as the input
+            return box_pts.reshape(-1, 1, 2).astype(np.float32)
+        
+    elif shape_class_name == "Triangle" and len(poly_2d) == 3:
+        # For tangram triangles (isosceles right triangles).
+        angles = calculate_internal_angles(poly_2d)
+        if not angles: return polygon # Should not happen
+
+        # Find the apex (the corner with the ~90-degree angle)
+        apex_index = np.argmin(np.abs(np.array(angles) - 90.0))
+        p_apex = poly_2d[apex_index]
+        
+        # The other two points form the hypotenuse
+        p_base1 = poly_2d[(apex_index + 1) % 3]
+        p_base2 = poly_2d[(apex_index + 2) % 3]
+
+        # Preserve original area to calculate ideal leg length
+        area = cv2.contourArea(poly_2d)
+        if area > 0:
+            # Area of right triangle = 0.5 * leg1 * leg2. For isosceles, leg1=leg2.
+            # So, Area = 0.5 * leg^2  => leg = sqrt(2 * Area)
+            ideal_leg_length = np.sqrt(2 * area)
+
+            # Vectors from the detected apex to the other two vertices
+            vec1 = p_base1 - p_apex
+            vec2 = p_base2 - p_apex
+            
+            # Average the length of the two legs from the detection for stability
+            avg_detected_leg_length = (np.linalg.norm(vec1) + np.linalg.norm(vec2)) / 2.0
+            if avg_detected_leg_length == 0: return polygon # Avoid division by zero
+
+            # Create new, perfectly perpendicular vectors with the ideal length
+            # We align them with the original detected vectors to preserve orientation
+            v1_new = (vec1 / np.linalg.norm(vec1)) * ideal_leg_length
+            v2_new = (vec2 / np.linalg.norm(vec2)) * ideal_leg_length
+
+            # To make them perfectly 90 degrees, we can average their direction and then
+            # rotate +/- 45 degrees. This is more robust to skewed inputs.
+            bisector_vec = normalize_vector(normalize_vector(vec1) + normalize_vector(vec2))
+            
+            # Rotation matrix for +45 and -45 degrees
+            cos45, sin45 = np.cos(np.pi/4), np.sin(np.pi/4)
+            rot_plus_45 = np.array([[cos45, -sin45], [sin45, cos45]])
+            rot_minus_45 = np.array([[cos45, sin45], [-sin45, cos45]])
+            
+            leg_vec1 = rot_minus_45 @ bisector_vec * ideal_leg_length
+            leg_vec2 = rot_plus_45 @ bisector_vec * ideal_leg_length
+
+            # Re-create the triangle from the original apex
+            new_p_base1 = p_apex + leg_vec1
+            new_p_base2 = p_apex + leg_vec2
+
+            regularized_triangle = np.array([p_apex, new_p_base1, new_p_base2], dtype=np.float32)
+            
+            # Final check: The new centroid should be close to the old one.
+            # If it drifted too much, fall back to the original polygon.
+            M_old = cv2.moments(poly_2d)
+            M_new = cv2.moments(regularized_triangle)
+            if M_old['m00'] > 0 and M_new['m00'] > 0:
+                cx_old, cy_old = M_old['m10']/M_old['m00'], M_old['m01']/M_old['m00']
+                cx_new, cy_new = M_new['m10']/M_new['m00'], M_new['m01']/M_new['m00']
+                if np.hypot(cx_old-cx_new, cy_old-cy_new) < 10.0: # Allow 10px drift
+                    return regularized_triangle.reshape(-1, 1, 2)
+
+    # For Parallelogram or other shapes, regularization is more complex.
+    # For now, we return the original polygon for them.
+    # A potential improvement for parallelogram would be to average opposite side lengths
+    # and angles.
+    return polygon
+
 def normalize_vector(v):
     norm = np.linalg.norm(v)
     if norm == 0: return v
@@ -206,47 +304,109 @@ def get_hue_distance(h1, h2, max_hue_val=179):
     return min(diff, (max_hue_val + 1) - diff)
 
 def process_tangrams_in_warped_frame(warped_frame, config_data, debug_pid_str=None, show_cv_windows=True, frame_num_debug=0):
-    if warped_frame is None or warped_frame.size == 0: print("ERROR: Received empty warped_frame."); return {}
+    if warped_frame is None or warped_frame.size == 0:
+        print("ERROR: Received empty warped_frame.")
+        return {}
 
     blur_warped_frame = cv2.GaussianBlur(warped_frame, PIECE_BLUR_KERNEL_SIZE, 0)
-    # Assuming HSV color space for all pieces as per simplification
     conv_img_masking = cv2.cvtColor(blur_warped_frame, cv2.COLOR_BGR2HSV)
-    ch0_max, ch1_max, ch2_max = 179, 255, 255 # Max values for H, S, V
+    ch0_max, ch1_max, ch2_max = 179, 255, 255
 
     morph_k_piece = np.ones(PIECE_MORPH_KERNEL_SIZE, np.uint8)
     raw_detected_piece_data = {}
 
     for pid, p_attrs in config_data.items():
-        # Ensure piece configuration uses HSV, otherwise, this will fail or be incorrect.
-        # The key 'color_space' in p_attrs should be 'hsv'.
-        p_color_space_key = p_attrs.get('color_space', 'hsv') # Default to hsv if not specified
+        p_color_space_key = p_attrs.get('color_space', 'hsv')
         if p_color_space_key != 'hsv':
-            print(f"WARNING: Piece {pid} has color_space '{p_color_space_key}', but only 'hsv' is fully supported in this simplified version. Attempting to use hsv_lower/hsv_upper keys.")
-            # Fallback or error: For simplicity, we assume config has 'hsv_lower' and 'hsv_upper'
-            # or that the generic keys match HSV if color_space is different but we force HSV.
-            # This part depends on strictness. Best if config aligns with 'hsv' expectation.
+            print(f"WARNING: Piece {pid} has unsupported color_space '{p_color_space_key}'.")
 
         orig_low_thresh = np.array(p_attrs[f'{p_color_space_key}_lower'])
         orig_up_thresh = np.array(p_attrs[f'{p_color_space_key}_upper'])
-
         tgt_verts = p_attrs['num_vertices']
         min_area, max_area = p_attrs.get('min_area', 0), p_attrs.get('max_area', float('inf'))
-        tgt_area_mid = (min_area + max_area) / 2.0 if max_area != float('inf') and (min_area + max_area) > 0 else min_area * 1.5 if min_area > 0 else 1.0
-
-        original_color_center = (orig_low_thresh + orig_up_thresh) / 2.0
-        original_color_range_half = (orig_up_thresh - orig_low_thresh) / 2.0
-        original_color_range_half[original_color_range_half == 0] = 1.0 # Avoid division by zero; treats exact value matches correctly
+        shape_class = p_attrs.get("class_name", "Unknown")
 
         best_poly_in_warped_coords = None
         best_combined_score = float('inf')
 
+        # --- Nested Helper Function for Clarity ---
+        def _process_contour(cnt, relax_step):
+            """Processes a single contour, returning a candidate polygon and its score, or None."""
+            area = cv2.contourArea(cnt)
+            min_area_mult = 1 - AREA_RELAX_FACTOR_PER_STEP * relax_step
+            max_area_mult = 1 + AREA_RELAX_FACTOR_PER_STEP * relax_step
+            relaxed_min_a = max(0.0, min_area * min_area_mult)
+            relaxed_max_a = max_area * max_area_mult
+
+            if not (relaxed_min_a <= area <= relaxed_max_a):
+                return None, None
+
+            # --- Primary Detection Method: approxPolyDP ---
+            poly_found = False
+            candidate_poly = None
+            peri = cv2.arcLength(cnt, True)
+            if peri > 0:
+                for eps_factor in np.arange(PIECE_EPSILON_SEARCH_START, PIECE_EPSILON_SEARCH_END, PIECE_EPSILON_SEARCH_STEP):
+                    poly = cv2.approxPolyDP(cnt, eps_factor * peri, True)
+                    if len(poly) == tgt_verts:
+                        candidate_poly = poly
+                        poly_found = True
+                        break
+                    elif len(poly) < tgt_verts:
+                        break
+
+            # --- Fallback Detection Method for Small/Noisy Contours ---
+            if not poly_found and area < FALLBACK_MAX_AREA_PX:
+                if tgt_verts == 3: # Specific fallback for triangles
+                    ret, triangle = cv2.minEnclosingTriangle(cnt)
+                    if ret and triangle is not None:
+                        candidate_poly = triangle.astype(np.int32)
+                        poly_found = True
+                elif tgt_verts == 4: # Generic fallback for quadrilaterals
+                    rect = cv2.minAreaRect(cnt)
+                    box = cv2.boxPoints(rect)
+                    candidate_poly = box.astype(np.int32).reshape(4, 1, 2)
+                    poly_found = True
+
+            # --- If a polygon was found by any method, score it ---
+            if poly_found and candidate_poly is not None:
+                if is_shape_regular(candidate_poly, shape_class, tgt_verts):
+                    # Scoring logic (same as before)
+                    tgt_area_mid = (min_area + max_area) / 2.0 if max_area != float('inf') and (min_area + max_area) > 0 else min_area * 1.5 if min_area > 0 else 1.0
+                    original_color_center = (orig_low_thresh + orig_up_thresh) / 2.0
+                    original_color_range_half = (orig_up_thresh - orig_low_thresh) / 2.0
+                    original_color_range_half[original_color_range_half == 0] = 1.0
+                    
+                    area_diff_abs = abs(area - tgt_area_mid)
+                    normalized_area_distance = area_diff_abs / tgt_area_mid if tgt_area_mid > 0 else (0.0 if area_diff_abs == 0 else 1.0)
+                    
+                    contour_mask_for_avg_color = np.zeros(conv_img_masking.shape[:2], dtype=np.uint8)
+                    cv2.drawContours(contour_mask_for_avg_color, [cnt], -1, 255, -1)
+                    avg_color_tuple = cv2.mean(conv_img_masking, mask=contour_mask_for_avg_color)
+                    avg_color_piece = np.array(avg_color_tuple[:3])
+                    
+                    color_distances_per_channel = np.zeros(3)
+                    color_distances_per_channel[0] = get_hue_distance(avg_color_piece[0], original_color_center[0], ch0_max)
+                    color_distances_per_channel[1] = abs(avg_color_piece[1] - original_color_center[1])
+                    color_distances_per_channel[2] = abs(avg_color_piece[2] - original_color_center[2])
+                    
+                    normalized_color_distances = np.nan_to_num(color_distances_per_channel / original_color_range_half, nan=1.0)
+                    normalized_color_distance_avg = np.mean(np.clip(normalized_color_distances, 0.0, 1.0))
+
+                    score = (WEIGHT_COLOR_CLOSENESS * normalized_color_distance_avg +
+                             WEIGHT_AREA_CLOSENESS * normalized_area_distance)
+                    
+                    return candidate_poly, score
+            
+            return None, None
+        # --- End of Nested Helper Function ---
+
         for relax_step in range(MAX_RELAXATION_STEPS + 1):
             curr_low_thresh, curr_up_thresh = orig_low_thresh.copy(), orig_up_thresh.copy()
             if relax_step > 0:
-                ch0_adj = int(ch0_max * RELAX_PERCENT_INCREMENT_CH0 * relax_step) # Hue
-                ch1_adj = int(ch1_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step) # Saturation
-                ch2_adj = int(ch2_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step) # Value
-
+                ch0_adj = int(ch0_max * RELAX_PERCENT_INCREMENT_CH0 * relax_step)
+                ch1_adj = int(ch1_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step)
+                ch2_adj = int(ch2_max * RELAX_PERCENT_INCREMENT_CH12 * relax_step)
                 curr_low_thresh -= np.array([ch0_adj, ch1_adj, ch2_adj])
                 curr_up_thresh += np.array([ch0_adj, ch1_adj, ch2_adj])
                 np.clip(curr_low_thresh, 0, None, out=curr_low_thresh)
@@ -254,67 +414,37 @@ def process_tangrams_in_warped_frame(warped_frame, config_data, debug_pid_str=No
                 curr_up_thresh[1] = min(ch1_max, curr_up_thresh[1])
                 curr_up_thresh[2] = min(ch2_max, curr_up_thresh[2])
 
-            if conv_img_masking.size == 0: continue # Should not happen if warped_frame is valid
             color_mask = cv2.inRange(conv_img_masking, curr_low_thresh, curr_up_thresh)
             opened_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, morph_k_piece, iterations=PIECE_MORPH_OPEN_ITERATIONS)
             proc_mask = cv2.morphologyEx(opened_mask, cv2.MORPH_CLOSE, morph_k_piece, iterations=PIECE_MORPH_CLOSE_ITERATIONS)
 
-            if show_cv_windows and debug_pid_str == pid and warped_frame.size > 0 :
-                debug_mask_disp = warped_frame.copy(); debug_mask_disp[proc_mask == 0] = 0
+            if show_cv_windows and debug_pid_str == pid and warped_frame.size > 0:
+                debug_mask_disp = warped_frame.copy()
+                debug_mask_disp[proc_mask == 0] = 0
                 cv2.imshow(f"F{frame_num_debug} P_WARPED P{pid} R{relax_step}", debug_mask_disp)
 
             contours, _ = cv2.findContours(proc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+            found_in_this_step = False
             for cnt in contours:
-                area = cv2.contourArea(cnt)
-                min_area_mult = 1 - AREA_RELAX_FACTOR_PER_STEP * relax_step
-                max_area_mult = 1 + AREA_RELAX_FACTOR_PER_STEP * relax_step
-                relaxed_min_a = max(0.0, min_area * min_area_mult)
-                relaxed_max_a = max_area * max_area_mult
-                if not (relaxed_min_a <= area <= relaxed_max_a):
-                    continue
-
-                peri = cv2.arcLength(cnt, True)
-                if peri > 0:
-                    for eps_factor in np.arange(PIECE_EPSILON_SEARCH_START, PIECE_EPSILON_SEARCH_END, PIECE_EPSILON_SEARCH_STEP):
-                        poly = cv2.approxPolyDP(cnt, eps_factor * peri, True)
-                        if len(poly) == tgt_verts:
-                            shape_class = p_attrs.get("class_name", "Unknown")
-                            if is_shape_regular(poly, shape_class, tgt_verts):
-                                # Candidate Found - Calculate Combined Score
-                                area_diff_abs = abs(area - tgt_area_mid)
-                                normalized_area_distance = area_diff_abs / tgt_area_mid if tgt_area_mid > 0 else (0.0 if area_diff_abs == 0 else 1.0)
-
-                                contour_mask_for_avg_color = np.zeros(proc_mask.shape[:2], dtype=np.uint8)
-                                cv2.drawContours(contour_mask_for_avg_color, [cnt], -1, 255, -1)
-                                avg_color_tuple = cv2.mean(conv_img_masking, mask=contour_mask_for_avg_color)
-                                avg_color_piece = np.array(avg_color_tuple[:3]) # H, S, V
-
-                                color_distances_per_channel = np.zeros(3)
-                                color_distances_per_channel[0] = get_hue_distance(avg_color_piece[0], original_color_center[0], ch0_max)
-                                color_distances_per_channel[1] = abs(avg_color_piece[1] - original_color_center[1])
-                                color_distances_per_channel[2] = abs(avg_color_piece[2] - original_color_center[2])
-
-                                normalized_color_distances_per_channel = color_distances_per_channel / original_color_range_half
-                                normalized_color_distances_per_channel = np.nan_to_num(normalized_color_distances_per_channel, nan=1.0) # Handle potential division by zero if range_half was 0 and somehow not caught
-                                normalized_color_distances_per_channel = np.clip(normalized_color_distances_per_channel, 0.0, 1.0)
-                                normalized_color_distance_avg = np.mean(normalized_color_distances_per_channel)
-
-                                current_combined_score = (WEIGHT_COLOR_CLOSENESS * normalized_color_distance_avg +
-                                                          WEIGHT_AREA_CLOSENESS * normalized_area_distance)
-
-                                if current_combined_score < best_combined_score:
-                                    best_combined_score = current_combined_score
-                                    best_poly_in_warped_coords = extrude_polygon_corners(poly, PIECE_CORNER_EXTRUSION_PIXELS)
-                                break # Found a suitable polygon for this contour, evaluate its score
-                        elif len(poly) < tgt_verts:
-                            break # approxPolyDP will only reduce vertices
+                poly, score = _process_contour(cnt, relax_step)
+                if poly is not None and score is not None:
+                    if score < best_combined_score:
+                        best_combined_score = score
+                        regularized_poly = regularize_shape(poly, shape_class)
+                        best_poly_in_warped_coords = extrude_polygon_corners(regularized_poly, PIECE_CORNER_EXTRUSION_PIXELS)
+                        found_in_this_step = True
+            
+            # If we found a good candidate in this relaxation step, we don't need to relax further
+            if found_in_this_step:
+                break
 
         if best_poly_in_warped_coords is not None:
             raw_detected_piece_data[pid] = {
                 'poly': best_poly_in_warped_coords,
-                'score': best_combined_score # Optionally store the score for debugging or advanced logic
+                'score': best_combined_score
             }
+            
     return raw_detected_piece_data
 
 def get_default_piece_state():

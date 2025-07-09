@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backup data
+/data/bak/
+
+# Model files
+*.pt
+*.pth
+
+# Data, output, and runs directories
+/data/
+/runs/
+/output/

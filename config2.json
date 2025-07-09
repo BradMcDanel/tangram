@@ -1,0 +1,30 @@
+{
+  "1": {
+    "hsv_lower": [0, 90, 185], "hsv_upper": [20, 220, 255],
+    "min_area": 20, "color_name": "Pink", "class_name": "Triangle"
+  },
+  "2": {
+    "hsv_lower": [0, 140, 162], "hsv_upper": [7, 255, 255],
+    "min_area": 50, "color_name": "Red", "class_name": "Triangle"
+  },
+  "3": {
+    "hsv_lower": [7, 50, 195], "hsv_upper": [10, 255, 255],
+    "min_area": 100, "color_name": "Orange", "class_name": "Triangle"
+  },
+  "4": {
+    "hsv_lower": [90, 80, 115], "hsv_upper": [115, 171, 230],
+    "min_area": 20, "color_name": "Blue", "class_name": "Triangle"
+  },
+  "5": {
+    "hsv_lower": [21, 80, 98], "hsv_upper": [95, 180, 180],
+    "min_area": 50, "color_name": "Green", "class_name": "Triangle"
+  },
+  "6": {
+    "hsv_lower": [20, 100, 189], "hsv_upper": [40, 255, 255],
+    "min_area": 50, "color_name": "Yellow", "class_name": "Square"
+  },
+  "7": {
+    "hsv_lower": [139, 31, 77], "hsv_upper": [179, 100, 157],
+    "min_area": 50, "color_name": "Purple", "class_name": "Parallelogram"
+  }
+}
